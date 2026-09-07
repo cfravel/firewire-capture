@@ -1,0 +1,21 @@
+# Visual Studio build products and local state
+.vs/
+bin/
+obj/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+# Captures and proprietary components must not be committed
+*.m2t
+*.dv
+*.avi
+*.ax
+*.dll
+*.exe
+*.pdb
+*.lib
+*.exp
+*.obj
+.kilo/
