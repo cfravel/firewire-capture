@@ -31,6 +31,9 @@ It outputs the capture as unmodified, not transcoded .dv or .m2t files
   - [Expanded AV/C transport control](#expanded-avc-transport-control)
   - [Usability](#usability)
 - [Out of scope](#out-of-scope)
+- [Contact and contributing](#contact-and-contributing)
+- [How to report Security Vulnerabilities](#how-to-report-Security-Vulnerabilities)
+
 ## Licensing and third-party components
 This project is provided under the license in the accompanying LICENSE file (MIT open source license).
 This project is built using Microsoft Windows APIs and does not use or require third-party runtime binaries.
@@ -456,3 +459,15 @@ A GUI is not a prerequisite for a useful archival tool, but may be a nice to hav
 
 Captured material can be processed by dedicated tools after preservation ingest.
 
+## Contact and contributing
+
+For bugs, capture problems, compatibility reports, or concrete feature requests,
+please open a GitHub Issue.
+
+For questions, ideas, hardware experiences, or general discussion, use GitHub Discussions.
+
+Pull requests are welcome.
+
+## How to report Security Vulnerabilities
+For `security vulnerabilities`, please follow the instructions in `SECURITY.md`
+rather than opening a public issue.
