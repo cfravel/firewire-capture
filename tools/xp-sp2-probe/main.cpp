@@ -76,6 +76,16 @@ public:
         while (count != 0) AppendChar(digits[--count]);
     }
 
+    void AppendUInt64(ULONGLONG value) {
+        wchar_t digits[32];
+        ULONG count = 0;
+        do {
+            digits[count++] = static_cast<wchar_t>(L'0' + value % 10);
+            value /= 10;
+        } while (value != 0 && count < ARRAYSIZE(digits));
+        while (count != 0) AppendChar(digits[--count]);
+    }
+
     void AppendHex(ULONG value) {
         static const wchar_t digits[] = L"0123456789ABCDEF";
         Append(L"0x");
@@ -245,8 +255,12 @@ public:
         return outputFile_ == INVALID_HANDLE_VALUE ? HRESULT_FROM_WIN32(GetLastError())
                                                     : S_OK;
     }
+    void SetDiscard() { outputFile_ = INVALID_HANDLE_VALUE; }
     HRESULT Write(IMediaSample* sample);
-    ULONGLONG Bytes() const { return bytes_; }
+    ULONGLONG Bytes() {
+        return static_cast<ULONGLONG>(
+            InterlockedCompareExchange64(&bytes_, 0, 0));
+    }
     ULONG Samples() const { return samples_; }
 
     STDMETHODIMP QueryInterface(REFIID iid, void** object) override;
@@ -495,9 +509,11 @@ HRESULT CaptureSink::Write(IMediaSample* sample) {
     HRESULT hr = sample->GetPointer(&data);
     if (FAILED(hr)) return hr;
     DWORD written = 0;
-    if (!WriteFile(outputFile_, data, static_cast<DWORD>(length), &written, 0) ||
-        written != static_cast<DWORD>(length)) {
-        return HRESULT_FROM_WIN32(GetLastError());
+    if (outputFile_ != INVALID_HANDLE_VALUE) {
+        if (!WriteFile(outputFile_, data, static_cast<DWORD>(length), &written, 0) ||
+            written != static_cast<DWORD>(length)) {
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
     }
     InterlockedExchangeAdd64(&bytes_, length);
     InterlockedIncrement(&samples_);
@@ -824,7 +840,111 @@ HRESULT ConnectNative(IGraphBuilder* graph, IPin* output, IPin* input) {
     return lastError;
 }
 
-int RunCapture(const wchar_t* outputPath) {
+bool EndsWithInsensitive(const wchar_t* text, const wchar_t* suffix) {
+    ULONG textLength = 0;
+    ULONG suffixLength = 0;
+    while (text[textLength] != L'\0') ++textLength;
+    while (suffix[suffixLength] != L'\0') ++suffixLength;
+    if (suffixLength > textLength) return false;
+    for (ULONG index = 0; index < suffixLength; ++index) {
+        wchar_t left = text[textLength - suffixLength + index];
+        wchar_t right = suffix[index];
+        if (left >= L'A' && left <= L'Z') left += L'a' - L'A';
+        if (right >= L'A' && right <= L'Z') right += L'a' - L'A';
+        if (left != right) return false;
+    }
+    return true;
+}
+
+HRESULT NormalizeCapturePath(const wchar_t* requested,
+                             CaptureKind kind,
+                             wchar_t* result,
+                             ULONG capacity) {
+    if (requested == 0 || result == 0 || capacity == 0) return E_POINTER;
+    ULONG length = 0;
+    while (requested[length] != L'\0') {
+        if (length + 1 >= capacity) return HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
+        result[length] = requested[length];
+        ++length;
+    }
+    result[length] = L'\0';
+    const wchar_t* suffix = kind == CaptureKind::Dv ? L".dv" : L".m2t";
+    if (EndsWithInsensitive(result, suffix)) return S_OK;
+    ULONG suffixLength = 0;
+    while (suffix[suffixLength] != L'\0') ++suffixLength;
+    if (length + suffixLength + 1 > capacity) {
+        return HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
+    }
+    for (ULONG index = 0; index < suffixLength; ++index) {
+        result[length + index] = suffix[index];
+    }
+    result[length + suffixLength] = L'\0';
+    return S_OK;
+}
+
+volatile LONG g_productStop = 0;
+
+BOOL WINAPI ProductControlHandler(DWORD signal) {
+    if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT ||
+        signal == CTRL_CLOSE_EVENT) {
+        InterlockedExchange(&g_productStop, 1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void PrintCaptureProgress(CaptureKind kind, CaptureSink* sink, ULONG elapsed) {
+    Text progress;
+    progress.Append(kind == CaptureKind::Dv ? L"DV" : L"HDV");
+    progress.Append(L" elapsed=");
+    progress.AppendUInt(elapsed / 1000);
+    progress.Append(L"s samples=");
+    progress.AppendUInt(sink->Samples());
+    progress.Append(L" bytes=");
+    progress.AppendUInt64(sink->Bytes());
+    progress.Append(L"\n");
+    progress.Flush();
+}
+
+void WaitForProductStop(CaptureKind kind, CaptureSink* sink) {
+    InterlockedExchange(&g_productStop, 0);
+    SetConsoleCtrlHandler(ProductControlHandler, TRUE);
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD consoleMode = 0;
+    const bool consoleInput = input != INVALID_HANDLE_VALUE &&
+                               GetConsoleMode(input, &consoleMode) != FALSE;
+    ULONG started = GetTickCount();
+    ULONG nextProgress = started;
+    while (InterlockedCompareExchange(&g_productStop, 0, 0) == 0) {
+        if (consoleInput && WaitForSingleObject(input, 200) == WAIT_OBJECT_0) {
+            INPUT_RECORD records[16];
+            DWORD read = 0;
+            if (ReadConsoleInputW(input, records, ARRAYSIZE(records), &read)) {
+                for (DWORD index = 0; index < read; ++index) {
+                    if (records[index].EventType == KEY_EVENT &&
+                        records[index].Event.KeyEvent.bKeyDown &&
+                        records[index].Event.KeyEvent.wVirtualKeyCode == VK_RETURN) {
+                        InterlockedExchange(&g_productStop, 1);
+                    }
+                }
+            }
+        } else {
+            Sleep(200);
+        }
+        ULONG now = GetTickCount();
+        if (static_cast<LONG>(now - nextProgress) >= 0) {
+            PrintCaptureProgress(kind, sink, now - started);
+            nextProgress = now + 1000;
+        }
+    }
+    SetConsoleCtrlHandler(ProductControlHandler, FALSE);
+}
+
+int RunCapture(const wchar_t* outputPath,
+               bool indefinite = false,
+               bool discard = false,
+               bool verbose = false) {
+    UNREFERENCED_PARAMETER(verbose);
     HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         PrintHResult(L"CoInitializeEx", hr);
@@ -863,6 +983,19 @@ int RunCapture(const wchar_t* outputPath) {
         return 1;
     }
 
+    wchar_t capturePath[1024];
+    hr = NormalizeCapturePath(outputPath, kind, capturePath,
+                              ARRAYSIZE(capturePath));
+    if (FAILED(hr)) {
+        PrintHResult(L"Normalize output path", hr);
+        output.Reset();
+        source.Reset();
+        control.Reset();
+        graph.Reset();
+        CoUninitialize();
+        return 1;
+    }
+
     ComPtr<CaptureSink> sink;
     *sink.Put() = new CaptureSink();
     if (sink.Get() == 0) {
@@ -874,16 +1007,20 @@ int RunCapture(const wchar_t* outputPath) {
         CoUninitialize();
         return 1;
     }
-    hr = sink->Open(outputPath);
-    if (FAILED(hr)) {
-        PrintHResult(L"Open output file", hr);
-        sink.Reset();
-        output.Reset();
-        source.Reset();
-        control.Reset();
-        graph.Reset();
-        CoUninitialize();
-        return 1;
+    if (discard && kind == CaptureKind::Hdv) {
+        sink->SetDiscard();
+    } else {
+        hr = sink->Open(capturePath);
+        if (FAILED(hr)) {
+            PrintHResult(L"Open output file", hr);
+            sink.Reset();
+            output.Reset();
+            source.Reset();
+            control.Reset();
+            graph.Reset();
+            CoUninitialize();
+            return 1;
+        }
     }
 
     PrintLine(L"Capture: adding source filter");
@@ -918,8 +1055,11 @@ int RunCapture(const wchar_t* outputPath) {
                            reinterpret_cast<void**>(transport.Put()));
 
     PrintLine(kind == CaptureKind::Dv ?
-              L"Capture mode: native DV; running for 10 seconds." :
-              L"Capture mode: native HDV; running for 10 seconds.");
+              (indefinite ? L"Capture mode: native DV; press Enter to stop."
+                           : L"Capture mode: native DV; running for 10 seconds.") :
+              (discard ? L"Capture mode: native HDV discard test; press Enter to stop."
+                       : (indefinite ? L"Capture mode: native HDV; press Enter to stop."
+                                     : L"Capture mode: native HDV; running for 10 seconds.")));
     PrintLine(L"Capture: starting graph");
     hr = control->Run();
     PrintHResult(L"Run capture graph", hr);
@@ -940,7 +1080,11 @@ int RunCapture(const wchar_t* outputPath) {
             HRESULT playHr = transport->put_Mode(ED_MODE_PLAY);
             PrintHResult(L"Command transport PLAY", playHr);
         }
-        Sleep(10000);
+        if (indefinite) {
+            WaitForProductStop(kind, sink.Get());
+        } else {
+            Sleep(10000);
+        }
         if (transport.Get() != 0) {
             HRESULT stopTransportHr = transport->put_Mode(ED_MODE_STOP);
             PrintHResult(L"Command transport STOP", stopTransportHr);
@@ -952,8 +1096,10 @@ int RunCapture(const wchar_t* outputPath) {
     Text result;
     result.Append(L"Samples received: ");
     result.AppendUInt(sink->Samples());
-    result.Append(L" bytes written: ");
-    result.AppendUInt(static_cast<ULONG>(sink->Bytes()));
+    result.Append(discard && kind == CaptureKind::Hdv
+                      ? L" bytes received: "
+                      : L" bytes written: ");
+    result.AppendUInt64(sink->Bytes());
     result.Append(L"\n");
     result.Flush();
 
@@ -967,6 +1113,67 @@ int RunCapture(const wchar_t* outputPath) {
     CoUninitialize();
     return FAILED(hr) ? 1 : 0;
 }
+
+bool NextArgument(const wchar_t** cursor, wchar_t* argument, ULONG capacity) {
+    if (cursor == 0 || *cursor == 0 || argument == 0 || capacity == 0) return false;
+    const wchar_t* text = *cursor;
+    while (*text == L' ' || *text == L'\t') ++text;
+    if (*text == L'\0') {
+        *cursor = text;
+        return false;
+    }
+    bool quoted = false;
+    if (*text == L'\"') {
+        quoted = true;
+        ++text;
+    }
+    ULONG length = 0;
+    while (*text != L'\0' &&
+           (quoted ? *text != L'\"' : (*text != L' ' && *text != L'\t'))) {
+        if (length + 1 >= capacity) return false;
+        argument[length++] = *text++;
+    }
+    if (quoted && *text == L'\"') ++text;
+    argument[length] = L'\0';
+    *cursor = text;
+    return length != 0;
+}
+
+#ifdef FWCAP_XP
+int ProductMain() {
+    const wchar_t* cursor = GetCommandLineW();
+    wchar_t argument[1024];
+    wchar_t outputPath[1024];
+    outputPath[0] = L'\0';
+    bool verbose = false;
+    bool hdvDiscard = false;
+    ULONG positional = 0;
+
+    // Skip the executable name.
+    NextArgument(&cursor, argument, ARRAYSIZE(argument));
+    while (NextArgument(&cursor, argument, ARRAYSIZE(argument))) {
+        if (wcscmp(argument, L"-v") == 0 ||
+            wcscmp(argument, L"--verbose") == 0) {
+            verbose = true;
+        } else if (wcscmp(argument, L"--hdv-discard") == 0) {
+            hdvDiscard = true;
+        } else if (positional == 0) {
+            wcscpy_s(outputPath, ARRAYSIZE(outputPath), argument);
+            positional = 1;
+        } else {
+            PrintLine(L"Usage: fwcap-xp.exe [-v] [--hdv-discard] <capture-name>");
+            return 2;
+        }
+    }
+
+    if (positional != 1) {
+        PrintLine(L"Usage: fwcap-xp.exe [-v] [--hdv-discard] <capture-name>");
+        return 2;
+    }
+    if (verbose) PrintLine(L"fwcap-xp: verbose capture diagnostics enabled.");
+    return RunCapture(outputPath, true, hdvDiscard, verbose);
+}
+#endif
 
 int ProbeMain() {
     wchar_t outputPath[1024];
@@ -1030,5 +1237,9 @@ int ProbeMain() {
 }
 
 extern "C" void WINAPI XpProbeEntry() {
+#ifdef FWCAP_XP
+    ExitProcess(static_cast<UINT>(ProductMain()));
+#else
     ExitProcess(static_cast<UINT>(ProbeMain()));
+#endif
 }
