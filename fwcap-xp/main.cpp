@@ -184,8 +184,28 @@ void PrintHResult(const wchar_t* label, HRESULT hr) {
     output.Append(label);
     output.Append(L": ");
     output.AppendHex(static_cast<ULONG>(hr));
+    wchar_t text[256];
+    const DWORD length = AMGetErrorTextW(hr, text, ARRAYSIZE(text));
+    if (length != 0) {
+        output.Append(L" (");
+        output.Append(text);
+        output.AppendChar(L')');
+    }
     output.Append(L"\n");
     output.Flush();
+}
+
+bool g_productMode = false;
+bool g_productVerbose = false;
+
+void ProductDiagnosticLine(const wchar_t* text) {
+    if (!g_productMode || g_productVerbose) PrintLine(text);
+}
+
+void ProductDiagnosticHResult(const wchar_t* label, HRESULT hr) {
+    if (!g_productMode || g_productVerbose || FAILED(hr)) {
+        PrintHResult(label, hr);
+    }
 }
 
 void ClearMediaType(AM_MEDIA_TYPE* type) {
@@ -210,9 +230,40 @@ enum class CaptureKind {
     Hdv,
 };
 
+struct DvTimecode {
+    int hours;
+    int minutes;
+    int seconds;
+    int frames;
+};
+
+int BcdValue(BYTE value) {
+    return (value & 0x0F) + 10 * ((value >> 4) & 0x0F);
+}
+
+bool FindDvTimecode(const BYTE* data, long length, DvTimecode* result) {
+    if (data == 0 || result == 0 || length < 5) return false;
+    for (long index = 0; index <= length - 5; ++index) {
+        if (data[index] != 0x13) continue;
+        const int frames = BcdValue(data[index + 1] & 0x3F);
+        const int seconds = BcdValue(data[index + 2] & 0x7F);
+        const int minutes = BcdValue(data[index + 3] & 0x7F);
+        const int hours = BcdValue(data[index + 4] & 0x3F);
+        if (frames >= 30 || seconds >= 60 || minutes >= 60 || hours >= 24) continue;
+        result->hours = hours;
+        result->minutes = minutes;
+        result->seconds = seconds;
+        result->frames = frames;
+        return true;
+    }
+    return false;
+}
+
 static const GUID kMediaTypeAudioVideo = {
     0x73766169, 0x0000, 0x0010,
     {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+
+bool IsFireWirePath(const wchar_t* path);
 
 bool IsDvType(const AM_MEDIA_TYPE& type) {
     return (type.majortype == MEDIATYPE_Interleaved ||
@@ -256,12 +307,19 @@ public:
                                                     : S_OK;
     }
     void SetDiscard() { outputFile_ = INVALID_HANDLE_VALUE; }
+    void SetHdv(bool hdv) { hdvStream_ = hdv ? 1 : 0; }
     HRESULT Write(IMediaSample* sample);
     ULONGLONG Bytes() {
         return static_cast<ULONGLONG>(
             InterlockedCompareExchange64(&bytes_, 0, 0));
     }
     ULONG Samples() const { return samples_; }
+    ULONG LastSampleTick() const {
+        return static_cast<ULONG>(
+            InterlockedCompareExchange(const_cast<volatile LONG*>(&lastSampleTick_), 0, 0));
+    }
+    bool LatestTimecode(DvTimecode* result) const;
+    bool MediaDuration(REFERENCE_TIME* duration) const;
 
     STDMETHODIMP QueryInterface(REFIID iid, void** object) override;
     STDMETHODIMP_(ULONG) AddRef() override {
@@ -308,6 +366,13 @@ private:
     HANDLE outputFile_;
     volatile LONGLONG bytes_;
     volatile LONG samples_;
+    volatile LONG lastSampleTick_;
+    volatile LONG hasTimecode_;
+    volatile LONG latestTimecode_;
+    volatile LONG hasMediaTime_;
+    volatile LONGLONG firstSampleTime_;
+    volatile LONGLONG lastSampleEndTime_;
+    volatile LONG hdvStream_;
 };
 
 class CapturePin final : public IPin, public IMemInputPin {
@@ -342,6 +407,7 @@ public:
         if (!IsDvType(*type) && !IsHdvType(*type)) return VFW_E_TYPE_NOT_ACCEPTED;
         connectedPin_ = pin;
         connectedPin_->AddRef();
+        sink_->SetHdv(IsHdvType(*type));
         HRESULT hr = CopyMediaType(&connectedType_, type);
         if (FAILED(hr)) {
             connectedPin_->Release();
@@ -490,7 +556,10 @@ private:
 
 CaptureSink::CaptureSink()
     : references_(1), pin_(new CapturePin(this)),
-      outputFile_(INVALID_HANDLE_VALUE), bytes_(0), samples_(0) {}
+      outputFile_(INVALID_HANDLE_VALUE), bytes_(0), samples_(0),
+      lastSampleTick_(0), hasTimecode_(0), latestTimecode_(0),
+      hasMediaTime_(0), firstSampleTime_(0), lastSampleEndTime_(0),
+      hdvStream_(0) {}
 
 CaptureSink::~CaptureSink() {
     if (pin_ != 0) {
@@ -506,6 +575,7 @@ HRESULT CaptureSink::Write(IMediaSample* sample) {
     if (sample == 0) return E_POINTER;
     BYTE* data = 0;
     long length = sample->GetActualDataLength();
+    if (length < 0) return E_INVALIDARG;
     HRESULT hr = sample->GetPointer(&data);
     if (FAILED(hr)) return hr;
     DWORD written = 0;
@@ -515,9 +585,57 @@ HRESULT CaptureSink::Write(IMediaSample* sample) {
             return HRESULT_FROM_WIN32(GetLastError());
         }
     }
+    if (hdvStream_ == 0) {
+        DvTimecode timecode;
+        if (FindDvTimecode(data, length, &timecode)) {
+            const LONG packed = (timecode.hours << 24) |
+                                (timecode.minutes << 16) |
+                                (timecode.seconds << 8) |
+                                timecode.frames;
+            InterlockedExchange(&latestTimecode_, packed);
+            InterlockedExchange(&hasTimecode_, 1);
+        }
+    }
+    REFERENCE_TIME start = 0;
+    REFERENCE_TIME end = 0;
+    if (SUCCEEDED(sample->GetTime(&start, &end))) {
+        if (InterlockedCompareExchange(&hasMediaTime_, 1, 0) == 0) {
+            InterlockedExchange64(&firstSampleTime_, start);
+        }
+        InterlockedExchange64(&lastSampleEndTime_, end);
+    }
     InterlockedExchangeAdd64(&bytes_, length);
     InterlockedIncrement(&samples_);
+    InterlockedExchange(&lastSampleTick_, static_cast<LONG>(GetTickCount()));
     return S_OK;
+}
+
+bool CaptureSink::LatestTimecode(DvTimecode* result) const {
+    if (result == 0 || InterlockedCompareExchange(
+                           const_cast<volatile LONG*>(&hasTimecode_), 0, 0) == 0) {
+        return false;
+    }
+    const LONG packed = InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&latestTimecode_), 0, 0);
+    result->hours = (packed >> 24) & 0xFF;
+    result->minutes = (packed >> 16) & 0xFF;
+    result->seconds = (packed >> 8) & 0xFF;
+    result->frames = packed & 0xFF;
+    return true;
+}
+
+bool CaptureSink::MediaDuration(REFERENCE_TIME* duration) const {
+    if (duration == 0 || InterlockedCompareExchange(
+                             const_cast<volatile LONG*>(&hasMediaTime_), 0, 0) == 0) {
+        return false;
+    }
+    const LONGLONG first = InterlockedCompareExchange64(
+        const_cast<volatile LONGLONG*>(&firstSampleTime_), 0, 0);
+    const LONGLONG last = InterlockedCompareExchange64(
+        const_cast<volatile LONGLONG*>(&lastSampleEndTime_), 0, 0);
+    if (last < first) return false;
+    *duration = last - first;
+    return true;
 }
 
 STDMETHODIMP CaptureSink::QueryInterface(REFIID iid, void** object) {
@@ -716,10 +834,16 @@ void InspectDevice(IMoniker* moniker, ULONG index) {
     InspectPins(filter.Get());
 }
 
-HRESULT FindCaptureSource(IBaseFilter** source, IPin** output, CaptureKind* kind) {
-    if (source == 0 || output == 0 || kind == 0) return E_POINTER;
+HRESULT FindCaptureSource(IBaseFilter** source,
+                          IPin** output,
+                          CaptureKind* kind,
+                          wchar_t* deviceName,
+                          ULONG deviceNameCapacity) {
+    if (source == 0 || output == 0 || kind == 0 || deviceName == 0 ||
+        deviceNameCapacity == 0) return E_POINTER;
     *source = 0;
     *output = 0;
+    deviceName[0] = L'\0';
 
     ComPtr<ICreateDevEnum> devices;
     HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, 0,
@@ -736,6 +860,20 @@ HRESULT FindCaptureSource(IBaseFilter** source, IPin** output, CaptureKind* kind
         ComPtr<IMoniker> moniker;
         hr = monikers->Next(1, moniker.Put(), 0);
         if (hr != S_OK) break;
+
+        ComPtr<IPropertyBag> deviceProperties;
+        VARIANT devicePath;
+        VariantInit(&devicePath);
+        const bool hasProperties = SUCCEEDED(moniker->BindToStorage(
+            0, 0, IID_IPropertyBag,
+            reinterpret_cast<void**>(deviceProperties.Put())));
+        const bool hasFireWirePath = hasProperties &&
+                                     SUCCEEDED(deviceProperties->Read(
+                                         L"DevicePath", &devicePath, 0)) &&
+                                     devicePath.vt == VT_BSTR &&
+                                     IsFireWirePath(devicePath.bstrVal);
+        VariantClear(&devicePath);
+        if (!hasFireWirePath) continue;
 
         ComPtr<IBaseFilter> filter;
         if (FAILED(moniker->BindToObject(
@@ -774,6 +912,24 @@ HRESULT FindCaptureSource(IBaseFilter** source, IPin** output, CaptureKind* kind
             *output = pin.Get();
             (*output)->AddRef();
             *kind = candidate;
+            ComPtr<IPropertyBag> properties;
+            if (SUCCEEDED(moniker->BindToStorage(
+                    0, 0, IID_IPropertyBag,
+                    reinterpret_cast<void**>(properties.Put())))) {
+                VARIANT value;
+                VariantInit(&value);
+                if (SUCCEEDED(properties->Read(L"FriendlyName", &value, 0)) &&
+                    value.vt == VT_BSTR && value.bstrVal != 0) {
+                    wcscpy_s(deviceName, deviceNameCapacity, value.bstrVal);
+                }
+                VariantClear(&value);
+            }
+            if (deviceName[0] == L'\0') {
+                wcscpy_s(deviceName, deviceNameCapacity,
+                         candidate == CaptureKind::Dv
+                             ? L"Microsoft DV Camera and VCR"
+                             : L"Microsoft AV/C Tape Subunit Device");
+            }
             return S_OK;
         }
     }
@@ -820,13 +976,15 @@ HRESULT ConnectNative(IGraphBuilder* graph, IPin* output, IPin* input) {
         AM_MEDIA_TYPE* type = 0;
         hr = types->Next(1, &type, 0);
         if (hr != S_OK) break;
-        Text attempt;
-        attempt.Append(L"Capture: trying advertised media type major=");
-        attempt.AppendGuid(type->majortype);
-        attempt.Append(L" subtype=");
-        attempt.AppendGuid(type->subtype);
-        attempt.Append(L"\n");
-        attempt.Flush();
+        if (!g_productMode || g_productVerbose) {
+            Text attempt;
+            attempt.Append(L"Capture: trying advertised media type major=");
+            attempt.AppendGuid(type->majortype);
+            attempt.Append(L" subtype=");
+            attempt.AppendGuid(type->subtype);
+            attempt.Append(L"\n");
+            attempt.Flush();
+        }
 
         hr = graph->ConnectDirect(output, input, type);
         FreeMediaType(type);
@@ -854,6 +1012,29 @@ bool EndsWithInsensitive(const wchar_t* text, const wchar_t* suffix) {
         if (left != right) return false;
     }
     return true;
+}
+
+bool ContainsInsensitive(const wchar_t* text, const wchar_t* fragment) {
+    for (ULONG offset = 0; text[offset] != L'\0'; ++offset) {
+        ULONG index = 0;
+        while (fragment[index] != L'\0' && text[offset + index] != L'\0') {
+            wchar_t left = text[offset + index];
+            wchar_t right = fragment[index];
+            if (left >= L'A' && left <= L'Z') left += L'a' - L'A';
+            if (right >= L'A' && right <= L'Z') right += L'a' - L'A';
+            if (left != right) break;
+            ++index;
+        }
+        if (fragment[index] == L'\0') return true;
+    }
+    return false;
+}
+
+bool IsFireWirePath(const wchar_t* path) {
+    return path != 0 && (ContainsInsensitive(path, L"61883") ||
+                         ContainsInsensitive(path, L"1394") ||
+                         ContainsInsensitive(path, L"avc") ||
+                         ContainsInsensitive(path, L"firewire"));
 }
 
 HRESULT NormalizeCapturePath(const wchar_t* requested,
@@ -893,20 +1074,149 @@ BOOL WINAPI ProductControlHandler(DWORD signal) {
     return FALSE;
 }
 
-void PrintCaptureProgress(CaptureKind kind, CaptureSink* sink, ULONG elapsed) {
+void AppendTwoDigits(Text& output, ULONG value) {
+    output.AppendChar(static_cast<wchar_t>(L'0' + (value / 10) % 10));
+    output.AppendChar(static_cast<wchar_t>(L'0' + value % 10));
+}
+
+void AppendTimecode(Text& output, LONG packed, bool available) {
+    if (!available) {
+        output.Append(L"?:??:??:??");
+        return;
+    }
+    AppendTwoDigits(output, (packed >> 24) & 0xFF);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, (packed >> 16) & 0xFF);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, (packed >> 8) & 0xFF);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, packed & 0xFF);
+}
+
+bool ReadCurrentTimecode(CaptureKind kind,
+                         CaptureSink* sink,
+                         IAMTimecodeReader* reader,
+                         LONG* packed) {
+    if (packed == 0) return false;
+    if (kind == CaptureKind::Dv) {
+        DvTimecode value;
+        if (!sink->LatestTimecode(&value)) return false;
+        *packed = (value.hours << 24) | (value.minutes << 16) |
+                  (value.seconds << 8) | value.frames;
+        return true;
+    }
+    if (reader == 0) return false;
+    TIMECODE_SAMPLE sample = {};
+    sample.dwFlags = ED_DEVCAP_TIMECODE_READ;
+    if (FAILED(reader->GetTimecode(&sample))) return false;
+    const DWORD value = sample.timecode.dwFrames;
+    const int hours = ((value >> 28) & 0x0F) * 10 + ((value >> 24) & 0x0F);
+    const int minutes = ((value >> 20) & 0x0F) * 10 + ((value >> 16) & 0x0F);
+    const int seconds = ((value >> 12) & 0x0F) * 10 + ((value >> 8) & 0x0F);
+    const int frames = ((value >> 4) & 0x0F) * 10 + (value & 0x0F);
+    if (hours >= 24 || minutes >= 60 || seconds >= 60 || frames >= 60) return false;
+    *packed = (hours << 24) | (minutes << 16) | (seconds << 8) | frames;
+    return true;
+}
+
+void AppendDuration(Text& output, CaptureSink* sink, ULONG elapsed) {
+    REFERENCE_TIME duration = 0;
+    if (sink->MediaDuration(&duration)) {
+        LONGLONG remainder = duration;
+        ULONG seconds = 0;
+        while (remainder >= 10000000 && seconds != 0xFFFFFFFF) {
+            remainder -= 10000000;
+            ++seconds;
+        }
+        AppendTwoDigits(output, static_cast<ULONG>((seconds / 3600) % 100));
+        output.AppendChar(L':');
+        AppendTwoDigits(output, static_cast<ULONG>((seconds / 60) % 60));
+        output.AppendChar(L':');
+        AppendTwoDigits(output, static_cast<ULONG>(seconds % 60));
+        return;
+    }
+    const ULONG seconds = elapsed / 1000;
+    AppendTwoDigits(output, (seconds / 3600) % 100);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, (seconds / 60) % 60);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, seconds % 60);
+}
+
+void AppendWallDuration(Text& output, ULONG elapsed) {
+    const ULONG seconds = elapsed / 1000;
+    AppendTwoDigits(output, (seconds / 3600) % 100);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, (seconds / 60) % 60);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, seconds % 60);
+}
+
+void AppendTimecodeDuration(Text& output, LONG first, LONG last, bool available) {
+    if (!available) {
+        output.Append(L"");
+        return;
+    }
+    const LONG firstFrames = (((first >> 24) & 0xFF) * 3600 +
+                              ((first >> 16) & 0xFF) * 60 +
+                              ((first >> 8) & 0xFF)) * 30 + (first & 0xFF);
+    const LONG lastFrames = (((last >> 24) & 0xFF) * 3600 +
+                             ((last >> 16) & 0xFF) * 60 +
+                             ((last >> 8) & 0xFF)) * 30 + (last & 0xFF);
+    if (lastFrames < firstFrames) {
+        output.Append(L"");
+        return;
+    }
+    const ULONG seconds = static_cast<ULONG>((lastFrames - firstFrames) / 30);
+    AppendTwoDigits(output, (seconds / 3600) % 100);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, (seconds / 60) % 60);
+    output.AppendChar(L':');
+    AppendTwoDigits(output, seconds % 60);
+}
+
+void PrintCaptureProgress(CaptureKind kind,
+                          CaptureSink* sink,
+                          IAMTimecodeReader* reader,
+                          ULONG elapsed,
+                          LONG* lastTimecode,
+                          bool* hasTimecode,
+                          LONG* firstTimecode,
+                          bool* hasFirstTimecode) {
+    LONG currentTimecode = 0;
+    const bool currentAvailable = ReadCurrentTimecode(
+        kind, sink, reader, &currentTimecode);
+    if (currentAvailable) {
+        if (!*hasFirstTimecode) {
+            *firstTimecode = currentTimecode;
+            *hasFirstTimecode = true;
+        }
+        *lastTimecode = currentTimecode;
+        *hasTimecode = true;
+    }
     Text progress;
     progress.Append(kind == CaptureKind::Dv ? L"DV" : L"HDV");
-    progress.Append(L" elapsed=");
-    progress.AppendUInt(elapsed / 1000);
-    progress.Append(L"s samples=");
-    progress.AppendUInt(sink->Samples());
-    progress.Append(L" bytes=");
+    progress.Append(L"  Timecode ");
+    AppendTimecode(progress, currentTimecode, currentAvailable);
+    progress.Append(L"  Duration ");
+    AppendDuration(progress, sink, elapsed);
+    progress.Append(L"  Bytes ");
     progress.AppendUInt64(sink->Bytes());
-    progress.Append(L"\n");
+    progress.Append(L"   ");
+    progress.Append(L"\r");
     progress.Flush();
 }
 
-void WaitForProductStop(CaptureKind kind, CaptureSink* sink) {
+const wchar_t* WaitForProductStop(CaptureKind kind,
+                                  CaptureSink* sink,
+                                  IAMExtTransport* transport,
+                                  IMediaEventEx* events,
+                                  IAMTimecodeReader* reader,
+                                  LONG* lastTimecode,
+                                  bool* hasTimecode,
+                                  LONG* firstTimecode,
+                                  bool* hasFirstTimecode,
+                                  ULONG* elapsedResult) {
     InterlockedExchange(&g_productStop, 0);
     SetConsoleCtrlHandler(ProductControlHandler, TRUE);
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
@@ -915,6 +1225,9 @@ void WaitForProductStop(CaptureKind kind, CaptureSink* sink) {
                                GetConsoleMode(input, &consoleMode) != FALSE;
     ULONG started = GetTickCount();
     ULONG nextProgress = started;
+    ULONG lastActivity = started;
+    ULONGLONG lastBytes = sink->Bytes();
+    const wchar_t* stopReason = L"Enter";
     while (InterlockedCompareExchange(&g_productStop, 0, 0) == 0) {
         if (consoleInput && WaitForSingleObject(input, 200) == WAIT_OBJECT_0) {
             INPUT_RECORD records[16];
@@ -925,6 +1238,7 @@ void WaitForProductStop(CaptureKind kind, CaptureSink* sink) {
                         records[index].Event.KeyEvent.bKeyDown &&
                         records[index].Event.KeyEvent.wVirtualKeyCode == VK_RETURN) {
                         InterlockedExchange(&g_productStop, 1);
+                        stopReason = L"Enter";
                     }
                 }
             }
@@ -932,19 +1246,68 @@ void WaitForProductStop(CaptureKind kind, CaptureSink* sink) {
             Sleep(200);
         }
         ULONG now = GetTickCount();
+        if (events != 0) {
+            long eventCode = 0;
+            LONG_PTR parameter1 = 0;
+            LONG_PTR parameter2 = 0;
+            while (events->GetEvent(&eventCode, &parameter1, &parameter2, 0) == S_OK) {
+                events->FreeEventParams(eventCode, parameter1, parameter2);
+                if (eventCode == EC_COMPLETE) {
+                    stopReason = L"DirectShow end-of-stream";
+                    InterlockedExchange(&g_productStop, 1);
+                    break;
+                }
+                if (eventCode == EC_ERRORABORT || eventCode == EC_USERABORT) {
+                    stopReason = L"DirectShow graph abort";
+                    InterlockedExchange(&g_productStop, 1);
+                    break;
+                }
+            }
+        }
+        if (transport != 0 &&
+            InterlockedCompareExchange(&g_productStop, 0, 0) == 0) {
+            long mode = 0;
+            if (SUCCEEDED(transport->get_Mode(&mode)) && mode == ED_MODE_STOP) {
+                stopReason = L"Transport STOP";
+                InterlockedExchange(&g_productStop, 1);
+            }
+        }
+        ULONG sampleTick = sink->LastSampleTick();
+        if (sampleTick != 0 && static_cast<LONG>(sampleTick - lastActivity) > 0) {
+            lastActivity = sampleTick;
+        }
+        const ULONGLONG currentBytes = sink->Bytes();
+        if (currentBytes != lastBytes) {
+            lastBytes = currentBytes;
+            lastActivity = now;
+        }
+        if (static_cast<ULONG>(now - lastActivity) >= 10000 &&
+            InterlockedCompareExchange(&g_productStop, 0, 0) == 0) {
+            stopReason = L"No media activity for 10 seconds";
+            InterlockedExchange(&g_productStop, 1);
+        }
         if (static_cast<LONG>(now - nextProgress) >= 0) {
-            PrintCaptureProgress(kind, sink, now - started);
+            PrintCaptureProgress(kind, sink, reader, now - started,
+                                 lastTimecode, hasTimecode, firstTimecode,
+                                 hasFirstTimecode);
             nextProgress = now + 1000;
         }
     }
     SetConsoleCtrlHandler(ProductControlHandler, FALSE);
+    Text clear;
+    clear.Append(L"\r");
+    for (int index = 0; index < 120; ++index) clear.AppendChar(L' ');
+    clear.Append(L"\r\n");
+    clear.Flush();
+    if (elapsedResult != 0) *elapsedResult = GetTickCount() - started;
+    return stopReason;
 }
 
 int RunCapture(const wchar_t* outputPath,
                bool indefinite = false,
                bool discard = false,
                bool verbose = false) {
-    UNREFERENCED_PARAMETER(verbose);
+    g_productVerbose = verbose;
     HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         PrintHResult(L"CoInitializeEx", hr);
@@ -974,7 +1337,9 @@ int RunCapture(const wchar_t* outputPath,
     ComPtr<IBaseFilter> source;
     ComPtr<IPin> output;
     CaptureKind kind = CaptureKind::Dv;
-    hr = FindCaptureSource(source.Put(), output.Put(), &kind);
+    wchar_t deviceName[256];
+    hr = FindCaptureSource(source.Put(), output.Put(), &kind,
+                           deviceName, ARRAYSIZE(deviceName));
     if (FAILED(hr)) {
         PrintHResult(L"Find DV or HDV capture source", hr);
         control.Reset();
@@ -982,6 +1347,11 @@ int RunCapture(const wchar_t* outputPath,
         CoUninitialize();
         return 1;
     }
+    Text selected;
+    selected.Append(L"  Selected device: ");
+    selected.Append(deviceName);
+    selected.Append(L"\n");
+    selected.Flush();
 
     wchar_t capturePath[1024];
     hr = NormalizeCapturePath(outputPath, kind, capturePath,
@@ -995,6 +1365,11 @@ int RunCapture(const wchar_t* outputPath,
         CoUninitialize();
         return 1;
     }
+    Text outputText;
+    outputText.Append(L"  Output path: ");
+    outputText.Append(capturePath);
+    outputText.Append(L"\n");
+    outputText.Flush();
 
     ComPtr<CaptureSink> sink;
     *sink.Put() = new CaptureSink();
@@ -1023,23 +1398,23 @@ int RunCapture(const wchar_t* outputPath,
         }
     }
 
-    PrintLine(L"Capture: adding source filter");
-    hr = graph->AddFilter(source.Get(), L"FireWire source");
+    ProductDiagnosticLine(L"Capture: adding source filter");
+    hr = graph->AddFilter(source.Get(), deviceName);
     if (SUCCEEDED(hr)) {
-        PrintLine(L"Capture: adding native sink");
+        ProductDiagnosticLine(L"Capture: adding native sink");
         hr = graph->AddFilter(sink.Get(), L"Native file sink");
     }
     ComPtr<IPin> input;
     if (SUCCEEDED(hr)) {
-        PrintLine(L"Capture: locating sink input pin");
+        ProductDiagnosticLine(L"Capture: locating sink input pin");
         hr = sink->FindPin(L"Input", input.Put());
     }
     if (SUCCEEDED(hr)) {
-        PrintLine(L"Capture: connecting native pins");
+        ProductDiagnosticLine(L"Capture: connecting native pins");
         hr = ConnectNative(graph.Get(), output.Get(), input.Get());
     }
     if (FAILED(hr)) {
-        PrintHResult(L"Connect native capture graph", hr);
+        ProductDiagnosticHResult(L"Connect native capture graph", hr);
         input.Reset();
         sink.Reset();
         output.Reset();
@@ -1053,57 +1428,154 @@ int RunCapture(const wchar_t* outputPath,
     ComPtr<IAMExtTransport> transport;
     source->QueryInterface(IID_IAMExtTransport,
                            reinterpret_cast<void**>(transport.Put()));
+    long initialTransportMode = 0;
+    bool transportModeKnown = false;
+    if (transport.Get() != 0) {
+        const HRESULT modeHr = transport->get_Mode(&initialTransportMode);
+        ProductDiagnosticHResult(L"Read camera transport mode before graph start",
+                                 modeHr);
+        transportModeKnown = SUCCEEDED(modeHr);
+        if (transportModeKnown) {
+            Text modeText;
+            modeText.Append(L"  Initial transport mode: ");
+            modeText.AppendUInt(static_cast<ULONG>(initialTransportMode));
+            modeText.Append(L"\n");
+            modeText.Flush();
+        } else {
+            PrintLine(L"  Transport mode is unknown; PLAY will not be issued automatically.");
+        }
+    } else {
+        PrintLine(L"  Automatic PLAY is unavailable; capture will continue and the tape may be started manually.");
+    }
+    ComPtr<IAMTimecodeReader> timecodeReader;
+    const HRESULT timecodeHr = source->QueryInterface(
+        IID_IAMTimecodeReader,
+        reinterpret_cast<void**>(timecodeReader.Put()));
+    ProductDiagnosticHResult(L"Query capture source for IAMTimecodeReader",
+                             timecodeHr);
+    ComPtr<IMediaEventEx> events;
+    graph->QueryInterface(IID_IMediaEventEx,
+                          reinterpret_cast<void**>(events.Put()));
 
-    PrintLine(kind == CaptureKind::Dv ?
-              (indefinite ? L"Capture mode: native DV; press Enter to stop."
-                           : L"Capture mode: native DV; running for 10 seconds.") :
-              (discard ? L"Capture mode: native HDV discard test; press Enter to stop."
-                       : (indefinite ? L"Capture mode: native HDV; press Enter to stop."
-                                     : L"Capture mode: native HDV; running for 10 seconds.")));
-    PrintLine(L"Capture: starting graph");
+    Text captureNotice;
+    if (kind == CaptureKind::Dv) {
+        captureNotice.Append(L"Capturing native DV to ");
+        captureNotice.Append(capturePath);
+    } else if (discard) {
+        captureNotice.Append(L"HDV discard test is running; no file will be written.");
+    } else {
+        captureNotice.Append(L"Capturing to ");
+        captureNotice.Append(capturePath);
+    }
+    captureNotice.Append(L". Press Enter to stop.\n");
+    captureNotice.Flush();
+    ProductDiagnosticLine(L"Capture: starting graph");
     hr = control->Run();
-    PrintHResult(L"Run capture graph", hr);
+    ProductDiagnosticHResult(L"Run capture graph", hr);
+    LONG lastTimecode = 0;
+    bool hasTimecode = false;
+    LONG firstTimecode = 0;
+    bool hasFirstTimecode = false;
+    ULONG captureElapsed = 0;
+    const wchar_t* stopReason = L"Capture graph did not start";
     if (FAILED(hr)) {
         PrintLine(L"Capture graph did not start.");
     } else {
-        if (transport.Get() != 0) {
+        if (transport.Get() != 0 && transportModeKnown &&
+            initialTransportMode != ED_MODE_PLAY) {
+            HRESULT playHr = transport->put_Mode(ED_MODE_PLAY);
+            ProductDiagnosticHResult(L"Command camera transport PLAY", playHr);
+            if (SUCCEEDED(playHr)) {
+                Sleep(1000);
+                long mode = 0;
+                const HRESULT modeHr = transport->get_Mode(&mode);
+                ProductDiagnosticHResult(L"Read camera transport mode after PLAY",
+                                         modeHr);
+                if (SUCCEEDED(modeHr)) {
+                    Text modeText;
+                    modeText.Append(L"  Transport mode: ");
+                    modeText.AppendUInt(static_cast<ULONG>(mode));
+                    modeText.Append(L"\n");
+                    modeText.Flush();
+                }
+            }
+        } else if (transport.Get() != 0 &&
+                   initialTransportMode == ED_MODE_PLAY) {
+            ProductDiagnosticLine(L"  Camera is already playing; PLAY was not issued.");
+        }
+        stopReason = L"Capture ended";
+        if (indefinite) {
+            stopReason = WaitForProductStop(
+                kind, sink.Get(), transport.Get(), events.Get(),
+                timecodeReader.Get(), &lastTimecode, &hasTimecode,
+                &firstTimecode, &hasFirstTimecode, &captureElapsed);
+        } else {
+            Sleep(10000);
+        }
+    }
+    HRESULT graphStopHr = control->Stop();
+    ProductDiagnosticHResult(L"Stop capture graph", graphStopHr);
+    if (transport.Get() != 0) {
+        HRESULT stopTransportHr = transport->put_Mode(ED_MODE_STOP);
+        ProductDiagnosticHResult(L"Command transport STOP", stopTransportHr);
+        if (SUCCEEDED(stopTransportHr)) {
+            Sleep(1000);
             long mode = 0;
-            HRESULT modeHr = transport->get_Mode(&mode);
-            PrintHResult(L"Read transport mode before PLAY", modeHr);
+            const HRESULT modeHr = transport->get_Mode(&mode);
+            ProductDiagnosticHResult(L"Read camera transport mode after STOP",
+                                     modeHr);
             if (SUCCEEDED(modeHr)) {
                 Text modeText;
-                modeText.Append(L"Transport mode before PLAY: ");
+                modeText.Append(L"  Transport mode: ");
                 modeText.AppendUInt(static_cast<ULONG>(mode));
                 modeText.Append(L"\n");
                 modeText.Flush();
             }
-            HRESULT playHr = transport->put_Mode(ED_MODE_PLAY);
-            PrintHResult(L"Command transport PLAY", playHr);
-        }
-        if (indefinite) {
-            WaitForProductStop(kind, sink.Get());
-        } else {
-            Sleep(10000);
-        }
-        if (transport.Get() != 0) {
-            HRESULT stopTransportHr = transport->put_Mode(ED_MODE_STOP);
-            PrintHResult(L"Command transport STOP", stopTransportHr);
         }
     }
-    HRESULT graphStopHr = control->Stop();
-    PrintHResult(L"Stop capture graph", graphStopHr);
 
-    Text result;
-    result.Append(L"Samples received: ");
-    result.AppendUInt(sink->Samples());
-    result.Append(discard && kind == CaptureKind::Hdv
-                      ? L" bytes received: "
-                      : L" bytes written: ");
-    result.AppendUInt64(sink->Bytes());
-    result.Append(L"\n");
-    result.Flush();
+    if (indefinite) {
+        Text summary;
+        summary.Append(L"[SUMMARY] Format: ");
+        summary.Append(kind == CaptureKind::Dv ? L"DV" : L"HDV");
+        summary.Append(L"\n[SUMMARY] Stop reason: ");
+        summary.Append(stopReason);
+        summary.Append(L"\n[SUMMARY] Output: ");
+        summary.Append(discard && kind == CaptureKind::Hdv ? L"(discarded)" : capturePath);
+        summary.Append(L"\n[SUMMARY] Final timecode: ");
+        AppendTimecode(summary, lastTimecode, hasTimecode);
+        summary.Append(L"\n[SUMMARY] Total Capture Process Duration: ");
+        AppendWallDuration(summary, captureElapsed);
+        summary.Append(L"\n[SUMMARY] Video Duration: ");
+        if (hasFirstTimecode && hasTimecode) {
+            AppendTimecodeDuration(summary, firstTimecode, lastTimecode, true);
+        } else {
+            AppendDuration(summary, sink.Get(), captureElapsed);
+        }
+        summary.Append(L"\n[SUMMARY] Bytes: ");
+        summary.AppendUInt64(sink->Bytes());
+        summary.Append(L"\n[SUMMARY] ");
+        summary.Append(kind == CaptureKind::Dv ? L"DV" : L"HDV");
+        summary.Append(L" samples: ");
+        summary.AppendUInt(sink->Samples());
+        summary.Append(L"\n");
+        summary.Flush();
+    }
+
+    if (!indefinite) {
+        Text result;
+        result.Append(L"Samples received: ");
+        result.AppendUInt(sink->Samples());
+        result.Append(discard && kind == CaptureKind::Hdv
+                          ? L" bytes received: "
+                          : L" bytes written: ");
+        result.AppendUInt64(sink->Bytes());
+        result.Append(L"\n");
+        result.Flush();
+    }
 
     transport.Reset();
+    events.Reset();
     input.Reset();
     sink.Reset();
     output.Reset();
@@ -1170,6 +1642,8 @@ int ProductMain() {
         PrintLine(L"Usage: fwcap-xp.exe [-v] [--hdv-discard] <capture-name>");
         return 2;
     }
+    g_productMode = true;
+    g_productVerbose = verbose;
     if (verbose) PrintLine(L"fwcap-xp: verbose capture diagnostics enabled.");
     return RunCapture(outputPath, true, hdvDiscard, verbose);
 }

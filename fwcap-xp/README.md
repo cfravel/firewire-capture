@@ -5,7 +5,7 @@ This is an isolated XP SP2 x86 capture target. It is deliberately not part of
 source, libraries, or build outputs.
 
 The target compiles the XP-validated native capture implementation from
-`tools/xp-sp2-probe/main.cpp` into a separately named executable. Its CLI
+`fwcap-xp/main.cpp` into a separately named executable. Its CLI
 supports indefinite native DV/HDV capture until Enter or Ctrl+C:
 
 ```cmd
@@ -19,8 +19,9 @@ reports HDV samples without writing them to disk. `-v` is accepted for CLI
 compatibility and enables an explicit diagnostic notice.
 
 The XP target intentionally does not share the modern C++ runtime or source
-build settings. The implementation remains linked from the validated probe
-source while XP-specific capture and CLI behavior is stabilized.
+build settings. The diagnostic probe project compiles this same source without
+the `FWCAP_XP` define, while the XP product build owns the implementation in
+this directory.
 
 ## Build
 
