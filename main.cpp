@@ -155,6 +155,9 @@ bool FindDvTimecode(const BYTE* data, long length, DvTimecode* result) {
 }
 
 void FreeMediaType(AM_MEDIA_TYPE* type) {
+    if (type == nullptr) {
+        return;
+    }
     if (type->cbFormat != 0) {
         CoTaskMemFree(type->pbFormat);
     }
@@ -331,8 +334,7 @@ public:
             connectedPin_ = nullptr;
         }
         if (connectedType_.cbFormat != 0 || connectedType_.pUnk != nullptr) {
-            FreeMediaType(&connectedType_);
-            ZeroMemory(&connectedType_, sizeof(connectedType_));
+            ClearMediaType(&connectedType_);
         }
         return S_OK;
     }
@@ -401,6 +403,7 @@ public:
     STDMETHODIMP ReceiveCanBlock() override { return S_FALSE; }
 
     LONG SamplesReceived() const { return samplesReceived_; }
+    void DetachFilter() { filter_ = nullptr; }
 
 private:
     LONG references_ = 1;
@@ -548,15 +551,22 @@ public:
         }
         return E_NOINTERFACE;
     }
-    STDMETHODIMP_(ULONG) AddRef() override { return ++references_; }
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&references_));
+    }
     STDMETHODIMP_(ULONG) Release() override {
-        const ULONG references = --references_;
+        const ULONG references = static_cast<ULONG>(
+            InterlockedDecrement(&references_));
         if (references == 0) delete this;
         return references;
     }
     STDMETHODIMP Next(ULONG count, IPin** pins, ULONG* fetched) override;
     STDMETHODIMP Skip(ULONG count) override {
         if (count == 0) return S_OK;
+        if (index_ == 0 && count == 1) {
+            index_ = 1;
+            return S_OK;
+        }
         index_ = 1;
         return S_FALSE;
     }
@@ -586,36 +596,59 @@ public:
         }
         return E_NOINTERFACE;
     }
-    STDMETHODIMP_(ULONG) AddRef() override { return ++references_; }
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&references_));
+    }
     STDMETHODIMP_(ULONG) Release() override {
-        const ULONG references = --references_;
+        const ULONG references = static_cast<ULONG>(
+            InterlockedDecrement(&references_));
         if (references == 0) delete this;
         return references;
     }
     STDMETHODIMP Next(ULONG count,
                       AM_MEDIA_TYPE** types,
                       ULONG* fetched) override {
-        if (types == nullptr || (count != 1 && fetched == nullptr)) {
+        if (count == 0) {
+            return E_INVALIDARG;
+        }
+        if (types == nullptr ||
+            (count != 1 && fetched == nullptr)) {
             return E_POINTER;
         }
+        if (fetched != nullptr) *fetched = 0;
         const ULONG limit = hdv_ ? 1 : 3;
-        if (index_ >= limit) {
-            if (fetched != nullptr) *fetched = 0;
+        const ULONG remaining = limit - (index_ < limit ? index_ : limit);
+        const ULONG requested = count < remaining ? count : remaining;
+        if (requested == 0) {
             return S_FALSE;
         }
         static const GUID subtypes[] = {
             MEDIASUBTYPE_dvsd, MEDIASUBTYPE_dvhd, MEDIASUBTYPE_dvsl};
-        HRESULT hr = hdv_ ? CreateHdvMediaType(types)
-                          : CreateDvMediaType(subtypes[index_], types);
-        ++index_;
-        if (fetched != nullptr) *fetched = SUCCEEDED(hr) ? 1 : 0;
-        return hr;
+        ULONG produced = 0;
+        while (produced < requested) {
+            HRESULT hr = hdv_
+                             ? CreateHdvMediaType(&types[produced])
+                             : CreateDvMediaType(
+                                   subtypes[index_], &types[produced]);
+            if (FAILED(hr)) {
+                if (fetched != nullptr) *fetched = produced;
+                return hr;
+            }
+            ++index_;
+            ++produced;
+        }
+        if (fetched != nullptr) *fetched = produced;
+        return produced == count ? S_OK : S_FALSE;
     }
     STDMETHODIMP Skip(ULONG count) override {
-        index_ += count;
         const ULONG limit = hdv_ ? 1 : 3;
-        if (index_ > limit) index_ = limit;
-        return index_ == limit ? S_FALSE : S_OK;
+        const ULONG remaining = limit - (index_ < limit ? index_ : limit);
+        if (count <= remaining) {
+            index_ += count;
+            return S_OK;
+        }
+        index_ = limit;
+        return S_FALSE;
     }
     STDMETHODIMP Reset() override { index_ = 0; return S_OK; }
     STDMETHODIMP Clone(IEnumMediaTypes** clone) override {
@@ -642,7 +675,16 @@ DvDiscardFilter::~DvDiscardFilter() {
     if (outputFile_ != INVALID_HANDLE_VALUE) {
         CloseHandle(outputFile_);
     }
-    delete pin_;
+    if (graph_ != nullptr) {
+        graph_->Release();
+        graph_ = nullptr;
+    }
+    if (pin_ != nullptr) {
+        pin_->Disconnect();
+        pin_->DetachFilter();
+        pin_->Release();
+        pin_ = nullptr;
+    }
 }
 
 bool DvDiscardFilter::AcceptsMediaType(const AM_MEDIA_TYPE& type) const {
@@ -663,10 +705,13 @@ STDMETHODIMP DvDiscardFilter::QueryInterface(REFIID iid, void** object) {
     return E_NOINTERFACE;
 }
 
-STDMETHODIMP_(ULONG) DvDiscardFilter::AddRef() { return ++references_; }
+STDMETHODIMP_(ULONG) DvDiscardFilter::AddRef() {
+    return static_cast<ULONG>(InterlockedIncrement(&references_));
+}
 
 STDMETHODIMP_(ULONG) DvDiscardFilter::Release() {
-    const ULONG references = --references_;
+    const ULONG references = static_cast<ULONG>(
+        InterlockedDecrement(&references_));
     if (references == 0) delete this;
     return references;
 }
@@ -689,7 +734,14 @@ STDMETHODIMP DvDiscardFilter::QueryFilterInfo(FILTER_INFO* info) {
 }
 
 STDMETHODIMP DvDiscardFilter::JoinFilterGraph(IFilterGraph* graph, LPCWSTR) {
+    if (graph_ != nullptr) {
+        graph_->Release();
+        graph_ = nullptr;
+    }
     graph_ = graph;
+    if (graph_ != nullptr) {
+        graph_->AddRef();
+    }
     return S_OK;
 }
 
@@ -751,10 +803,13 @@ STDMETHODIMP DvDiscardPin::QueryInterface(REFIID iid, void** object) {
     return S_OK;
 }
 
-STDMETHODIMP_(ULONG) DvDiscardPin::AddRef() { return ++references_; }
+STDMETHODIMP_(ULONG) DvDiscardPin::AddRef() {
+    return static_cast<ULONG>(InterlockedIncrement(&references_));
+}
 
 STDMETHODIMP_(ULONG) DvDiscardPin::Release() {
-    const ULONG references = --references_;
+    const ULONG references = static_cast<ULONG>(
+        InterlockedDecrement(&references_));
     if (references == 0) delete this;
     return references;
 }
@@ -793,8 +848,9 @@ STDMETHODIMP DvDiscardPin::EnumMediaTypes(IEnumMediaTypes** types) {
 }
 
 STDMETHODIMP DvEnumPins::Next(ULONG count, IPin** pins, ULONG* fetched) {
+    if (count == 0) return E_INVALIDARG;
     if (pins == nullptr || (count != 1 && fetched == nullptr)) return E_POINTER;
-    if (index_ != 0 || count == 0) {
+    if (index_ != 0) {
         if (fetched != nullptr) *fetched = 0;
         return S_FALSE;
     }
@@ -802,7 +858,7 @@ STDMETHODIMP DvEnumPins::Next(ULONG count, IPin** pins, ULONG* fetched) {
     pin_->AddRef();
     index_ = 1;
     if (fetched != nullptr) *fetched = 1;
-    return S_OK;
+    return count == 1 ? S_OK : S_FALSE;
 }
 
 HRESULT FindCaptureOutput(IBaseFilter* filter,
