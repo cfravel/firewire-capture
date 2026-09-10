@@ -1,8 +1,8 @@
 # XP SP2 DirectShow Probe
 
-This is an isolated diagnostic utility for inspecting the DirectShow devices,
-pins, media types, and optional transport interfaces exposed by the XP SP2
-FireWire stack.
+This is an isolated diagnostic utility for inspecting and briefly capturing
+from DirectShow devices, pins, media types, and optional transport interfaces
+exposed by the XP SP2 FireWire stack.
 
 It is deliberately not part of `firewire-capture.sln` and does not include or
 link any production source files. Its output and intermediate files are kept
@@ -10,7 +10,7 @@ under this directory.
 
 ## Current scope
 
-The probe:
+With no output argument, the probe:
 
 1. initializes COM;
 2. enumerates `CLSID_VideoInputDeviceCategory` devices;
@@ -19,21 +19,33 @@ The probe:
 5. reports `IAMExtTransport` and `IAMTimecodeReader` availability;
 6. lists every pin and its media types.
 
-It does not start a graph, issue PLAY or STOP, write capture files, or decode
-video. This keeps the first XP test focused on device exposure and media
-negotiation.
+With one output argument, the probe instead selects the first `DV A/V Out` or
+`MPEG2TS Out` source, connects it to an isolated native sample-writing sink,
+starts the graph, issues PLAY, writes native samples for ten seconds, issues
+STOP, and reports sample and byte counts.
+
+The writing mode does not decode, transcode, or preview video. It is a short
+graph and disk-I/O test, not yet a full replacement for `fwcap.exe`.
 
 ## Build status
 
 The checked-in project is configured for an isolated x86 Release build with an
-XP API floor, static runtime, and a 5.01 console subsystem version. The current
-development machine only has the Visual Studio 2026 `v145` toolset installed.
+XP API floor, no linked C/C++ runtime, baseline IA-32 instructions, and a 5.01
+console subsystem version. The IA-32 instruction floor is required for older
+Pentium III-class XP machines that do not support SSE2.
+The current development machine only has the Visual Studio 2026 `v145`
+toolset installed.
 
-Therefore, an executable built here is not an XP SP2 binary. The current
-`v145` static runtime imports `InitializeCriticalSectionEx`, which is not
-available on XP SP2. Do not transfer the locally built executable to the
-laptop. Rebuild this project with an older compiler/toolchain known to support
-XP SP2, inspect its imports, and then test it on the offline XP machine.
+The probe uses a custom entry point and small Win32 output/runtime helpers so
+the resulting PE does not import the modern MSVC CRT. The locally inspected
+binary imports only XP-era functions from `KERNEL32`, `ole32`, and `OLEAUT32`,
+and has x86 PE and subsystem version 5.01. This is a strong compatibility
+signal, but it is not a substitute for running the probe on XP SP2. Transfer
+the Release executable only after reviewing the imports and keep the XP test
+machine offline.
+
+The probe's DirectShow device enumeration still depends on the XP system's
+registered DirectShow components and FireWire driver stack.
 
 Do not add this project to the production solution and do not change the
 production project's toolset to build it.
@@ -50,4 +62,19 @@ The output is:
 tools\xp-sp2-probe\bin\Release\xp-sp2-probe.exe
 ```
 
-Run the probe with the camcorder connected and powered on in VCR/playback mode.
+Run enumeration mode with no argument:
+
+```cmd
+xp-sp2-probe.exe
+```
+
+Run a ten-second native capture test with an output path:
+
+```cmd
+xp-sp2-probe.exe test.dv
+xp-sp2-probe.exe test.m2t
+```
+
+Use `test.dv` while the camcorder is in DV mode and `test.m2t` while it is in
+HDV mode. The extension is supplied by the operator; the probe selects the
+native stream based on the DirectShow output pin.
