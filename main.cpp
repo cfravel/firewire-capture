@@ -1583,6 +1583,9 @@ int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode) {
     std::wstring lastGoodTimecode = L"?:??:??:??";
     const wchar_t* stopReason = L"Enter";
     bool stopping = false;
+    HANDLE redirectedInput = GetStdHandle(STD_INPUT_HANDLE);
+    const bool inputPipe = redirectedInput != INVALID_HANDLE_VALUE &&
+                           GetFileType(redirectedInput) == FILE_TYPE_PIPE;
     while (!stopping) {
         if (_kbhit()) {
             const int key = _getch();
@@ -1590,6 +1593,23 @@ int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode) {
                 stopReason = L"Enter";
                 stopping = true;
                 continue;
+            }
+        }
+        if (!stopping && inputPipe) {
+            DWORD available = 0;
+            if (PeekNamedPipe(redirectedInput, nullptr, 0, nullptr,
+                              &available, nullptr) && available != 0) {
+                char input[32] = {};
+                DWORD read = 0;
+                if (ReadFile(redirectedInput, input, sizeof(input), &read, nullptr)) {
+                    for (DWORD index = 0; index < read; ++index) {
+                        if (input[index] == '\r' || input[index] == '\n') {
+                            stopReason = L"GUI stop";
+                            stopping = true;
+                            break;
+                        }
+                    }
+                }
             }
         }
 

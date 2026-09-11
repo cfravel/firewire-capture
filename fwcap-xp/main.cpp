@@ -1225,6 +1225,8 @@ const wchar_t* WaitForProductStop(CaptureKind kind,
     DWORD consoleMode = 0;
     const bool consoleInput = input != INVALID_HANDLE_VALUE &&
                                GetConsoleMode(input, &consoleMode) != FALSE;
+    const bool inputPipe = input != INVALID_HANDLE_VALUE &&
+                           GetFileType(input) == FILE_TYPE_PIPE;
     ULONG started = GetTickCount();
     ULONG nextProgress = started;
     ULONG lastActivity = started;
@@ -1243,6 +1245,23 @@ const wchar_t* WaitForProductStop(CaptureKind kind,
                         stopReason = L"Enter";
                     }
                 }
+            }
+        } else if (inputPipe) {
+            DWORD available = 0;
+            if (PeekNamedPipe(input, 0, 0, 0, &available, 0) && available != 0) {
+                char inputBytes[32] = {};
+                DWORD read = 0;
+                if (ReadFile(input, inputBytes, sizeof(inputBytes), &read, 0)) {
+                    for (DWORD index = 0; index < read; ++index) {
+                        if (inputBytes[index] == '\r' || inputBytes[index] == '\n') {
+                            stopReason = L"GUI stop";
+                            InterlockedExchange(&g_productStop, 1);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                Sleep(200);
             }
         } else {
             Sleep(200);

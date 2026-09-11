@@ -58,6 +58,15 @@ struct GuiState {
     HBRUSH backgroundBrush;
     HBRUSH panelBrush;
     bool previewEnabled;
+    bool hdv;
+    PROCESS_INFORMATION captureProcess;
+    HANDLE captureInput;
+    HANDLE captureOutput;
+    wchar_t capturePath[MAX_PATH];
+    DWORD captureStartTick;
+    char captureOutputBuffer[8192];
+    int captureOutputLength;
+    bool captureRunning;
 };
 
 GuiState g_state = {};
@@ -67,6 +76,11 @@ IAMTimecodeReader* g_timecodeReader = 0;
 
 void SetText(HWND control, const wchar_t* text);
 void SetStatus(const wchar_t* text);
+void BrowseForOutput();
+void CopyText(wchar_t* destination, int capacity, const wchar_t* source);
+void EnsureCaptureExtension();
+void DrainCaptureOutput();
+void SetCaptureSummary(const wchar_t* prefix);
 
 void ReleaseCameraInterfaces() {
     if (g_timecodeReader != 0) {
@@ -89,6 +103,240 @@ void FormatTwoDigits(wchar_t* output, int offset, int value) {
 }
 
 void UpdateLiveStatus();
+
+void StopGuiCapture() {
+    if (!g_state.captureRunning) return;
+    const char stop = '\n';
+    DWORD written = 0;
+    if (g_state.captureInput != 0) {
+        WriteFile(g_state.captureInput, &stop, 1, &written, 0);
+    }
+    if (g_state.captureProcess.hProcess != 0) {
+        if (WaitForSingleObject(g_state.captureProcess.hProcess, 5000) == WAIT_TIMEOUT) {
+            TerminateProcess(g_state.captureProcess.hProcess, 1);
+        }
+        CloseHandle(g_state.captureProcess.hThread);
+        CloseHandle(g_state.captureProcess.hProcess);
+    }
+    DrainCaptureOutput();
+    if (g_state.captureInput != 0) CloseHandle(g_state.captureInput);
+    if (g_state.captureOutput != 0) CloseHandle(g_state.captureOutput);
+    g_state.captureProcess = PROCESS_INFORMATION();
+    g_state.captureInput = 0;
+    g_state.captureOutput = 0;
+    g_state.captureRunning = false;
+    SetCaptureSummary(L"Capture stopped;");
+}
+
+void UpdateCaptureStatus() {
+    if (!g_state.captureRunning) return;
+    DrainCaptureOutput();
+    if (WaitForSingleObject(g_state.captureProcess.hProcess, 0) != WAIT_TIMEOUT) {
+        StopGuiCapture();
+        SetStatus(L"Capture process finished.");
+        return;
+    }
+    LARGE_INTEGER size = {};
+    HANDLE output = CreateFileW(g_state.capturePath, GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    const bool hasSize = output != INVALID_HANDLE_VALUE &&
+                         GetFileSizeEx(output, &size) != FALSE;
+    if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+    if (hasSize) {
+        wchar_t progress[128] = L"Capture running; bytes: ";
+        wchar_t digits[32];
+        ULONGLONG value = static_cast<ULONGLONG>(size.QuadPart);
+        int count = 0;
+        do {
+            digits[count++] = static_cast<wchar_t>(L'0' + value % 10);
+            value /= 10;
+        } while (value != 0 && count < ARRAYSIZE(digits));
+        int offset = 23;
+        while (count != 0 && offset + 1 < ARRAYSIZE(progress)) {
+            progress[offset++] = digits[--count];
+        }
+        progress[offset] = L'\0';
+        SetText(g_state.progress, progress);
+    } else {
+        SetText(g_state.progress, L"Capture running; waiting for output data.");
+    }
+}
+
+const char* FindAscii(const char* text, int length, const char* search) {
+    int searchLength = 0;
+    while (search[searchLength] != '\0') ++searchLength;
+    for (int offset = 0; offset + searchLength <= length; ++offset) {
+        int index = 0;
+        while (index < searchLength && text[offset + index] == search[index]) ++index;
+        if (index == searchLength) return text + offset;
+    }
+    return 0;
+}
+
+void ProcessCaptureOutputLine(const char* line, int length) {
+    const char* timecode = FindAscii(line, length, "Timecode ");
+    if (timecode != 0) {
+        timecode += 9;
+        wchar_t display[32] = L"Timecode: --:--:--:--";
+        int index = 0;
+        while (index < 11 && timecode + index < line + length) {
+            display[10 + index] = static_cast<unsigned char>(timecode[index]);
+            ++index;
+        }
+        if (index == 11) SetText(g_state.timecode, display);
+    }
+}
+
+void DrainCaptureOutput() {
+    if (g_state.captureOutput == 0) return;
+    DWORD available = 0;
+    if (!PeekNamedPipe(g_state.captureOutput, 0, 0, 0, &available, 0) ||
+        available == 0) return;
+    char data[1024];
+    DWORD read = 0;
+    if (!ReadFile(g_state.captureOutput, data,
+                  available < sizeof(data) ? available : sizeof(data),
+                  &read, 0)) return;
+    for (DWORD index = 0; index < read; ++index) {
+        const char character = data[index];
+        if (character == '\r' || character == '\n') {
+            if (g_state.captureOutputLength != 0) {
+                ProcessCaptureOutputLine(g_state.captureOutputBuffer,
+                                         g_state.captureOutputLength);
+                g_state.captureOutputLength = 0;
+            }
+        } else if (g_state.captureOutputLength + 1 <
+                   ARRAYSIZE(g_state.captureOutputBuffer)) {
+            g_state.captureOutputBuffer[g_state.captureOutputLength++] = character;
+        }
+    }
+}
+
+void SetCaptureSummary(const wchar_t* prefix) {
+    LARGE_INTEGER size = {};
+    HANDLE output = CreateFileW(g_state.capturePath, GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    const bool hasSize = output != INVALID_HANDLE_VALUE &&
+                         GetFileSizeEx(output, &size) != FALSE;
+    if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+    wchar_t summary[256] = {};
+    CopyText(summary, ARRAYSIZE(summary), prefix);
+    int offset = 0;
+    while (summary[offset] != L'\0') ++offset;
+    CopyText(summary + offset, ARRAYSIZE(summary) - offset, L" bytes: ");
+    offset = 0;
+    while (summary[offset] != L'\0') ++offset;
+    ULONGLONG value = hasSize ? static_cast<ULONGLONG>(size.QuadPart) : 0;
+    wchar_t digits[32];
+    int count = 0;
+    do {
+        digits[count++] = static_cast<wchar_t>(L'0' + value % 10);
+        value /= 10;
+    } while (value != 0 && count < ARRAYSIZE(digits));
+    while (count != 0 && offset + 1 < ARRAYSIZE(summary)) {
+        summary[offset++] = digits[--count];
+    }
+    CopyText(summary + offset, ARRAYSIZE(summary) - offset, L" duration: ");
+    while (summary[offset] != L'\0') ++offset;
+    value = (GetTickCount() - g_state.captureStartTick) / 1000;
+    count = 0;
+    do {
+        digits[count++] = static_cast<wchar_t>(L'0' + value % 10);
+        value /= 10;
+    } while (value != 0 && count < ARRAYSIZE(digits));
+    while (count != 0 && offset + 1 < ARRAYSIZE(summary)) {
+        summary[offset++] = digits[--count];
+    }
+    CopyText(summary + offset, ARRAYSIZE(summary) - offset, L"s");
+    while (summary[offset] != L'\0') ++offset;
+    summary[offset] = L'\0';
+    SetText(g_state.progress, summary);
+}
+
+void StartGuiCapture() {
+    if (g_state.captureRunning) {
+        SetStatus(L"Capture is already running.");
+        return;
+    }
+    GetWindowTextW(g_state.outputPath, g_state.capturePath,
+                   ARRAYSIZE(g_state.capturePath));
+    if (g_state.capturePath[0] == L'\0') {
+        BrowseForOutput();
+        GetWindowTextW(g_state.outputPath, g_state.capturePath,
+                       ARRAYSIZE(g_state.capturePath));
+    }
+    if (g_state.capturePath[0] == L'\0') {
+        SetStatus(L"Choose an output file before starting capture.");
+        return;
+    }
+    EnsureCaptureExtension();
+
+    wchar_t executablePath[MAX_PATH] = {};
+    const DWORD pathLength = GetModuleFileNameW(
+        0, executablePath, ARRAYSIZE(executablePath));
+    if (pathLength == 0 || pathLength >= ARRAYSIZE(executablePath)) {
+        SetStatus(L"Unable to locate the capture executable.");
+        return;
+    }
+    wchar_t commandLine[2048] = L"\"";
+    CopyText(commandLine + 1, ARRAYSIZE(commandLine) - 1, executablePath);
+    int length = 1;
+    while (commandLine[length] != L'\0') ++length;
+    CopyText(commandLine + length, ARRAYSIZE(commandLine) - length,
+             L"\" -v \"");
+    length = 0;
+    while (commandLine[length] != L'\0') ++length;
+    CopyText(commandLine + length, ARRAYSIZE(commandLine) - length,
+             g_state.capturePath);
+    length = 0;
+    while (commandLine[length] != L'\0') ++length;
+    CopyText(commandLine + length, ARRAYSIZE(commandLine) - length, L"\"");
+
+    SECURITY_ATTRIBUTES security = {sizeof(security), 0, TRUE};
+    HANDLE childInput = 0;
+    HANDLE parentInput = 0;
+    HANDLE childOutput = 0;
+    HANDLE parentOutput = 0;
+    if (!CreatePipe(&childInput, &parentInput, &security, 0) ||
+        !CreatePipe(&parentOutput, &childOutput, &security, 0)) {
+        if (childInput != 0) CloseHandle(childInput);
+        if (parentInput != 0) CloseHandle(parentInput);
+        if (childOutput != 0) CloseHandle(childOutput);
+        if (parentOutput != 0) CloseHandle(parentOutput);
+        SetStatus(L"Unable to create capture control pipe.");
+        return;
+    }
+    SetHandleInformation(parentInput, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(parentOutput, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = childInput;
+    startup.hStdOutput = childOutput;
+    startup.hStdError = childOutput;
+    PROCESS_INFORMATION process = {};
+    if (!CreateProcessW(executablePath, commandLine, 0, 0, TRUE,
+                        CREATE_NO_WINDOW, 0, 0, &startup, &process)) {
+        CloseHandle(childInput);
+        CloseHandle(parentInput);
+        CloseHandle(childOutput);
+        CloseHandle(parentOutput);
+        SetStatus(L"Unable to start capture process.");
+        return;
+    }
+    CloseHandle(childInput);
+    CloseHandle(childOutput);
+    g_state.captureProcess = process;
+    g_state.captureInput = parentInput;
+    g_state.captureOutput = parentOutput;
+    g_state.captureOutputLength = 0;
+    g_state.captureStartTick = GetTickCount();
+    g_state.captureRunning = true;
+    SetText(g_state.progress, L"Capture starting...");
+    SetStatus(L"Native capture is running. Press Stop to finish.");
+}
 
 void SendTransportCommand(long mode, const wchar_t* name) {
     if (g_transport == 0) {
@@ -145,6 +393,38 @@ bool GuiIsFireWirePath(const wchar_t* path) {
                          GuiContainsInsensitive(path, L"1394") ||
                          GuiContainsInsensitive(path, L"avc") ||
                          GuiContainsInsensitive(path, L"firewire"));
+}
+
+bool GuiEndsWithInsensitive(const wchar_t* text, const wchar_t* suffix) {
+    int textLength = 0;
+    int suffixLength = 0;
+    while (text[textLength] != L'\0') ++textLength;
+    while (suffix[suffixLength] != L'\0') ++suffixLength;
+    if (suffixLength > textLength) return false;
+    for (int index = 0; index < suffixLength; ++index) {
+        wchar_t left = text[textLength - suffixLength + index];
+        wchar_t right = suffix[index];
+        if (left >= L'A' && left <= L'Z') left += L'a' - L'A';
+        if (right >= L'A' && right <= L'Z') right += L'a' - L'A';
+        if (left != right) return false;
+    }
+    return true;
+}
+
+void EnsureCaptureExtension() {
+    const wchar_t* suffix = g_state.hdv ? L".m2t" : L".dv";
+    if ((g_state.hdv && GuiEndsWithInsensitive(g_state.capturePath, L".m2t")) ||
+        (!g_state.hdv && GuiEndsWithInsensitive(g_state.capturePath, L".dv"))) {
+        return;
+    }
+    int length = 0;
+    while (g_state.capturePath[length] != L'\0') ++length;
+    int suffixLength = 0;
+    while (suffix[suffixLength] != L'\0') ++suffixLength;
+    if (length + suffixLength + 1 >= ARRAYSIZE(g_state.capturePath)) return;
+    CopyText(g_state.capturePath + length,
+             ARRAYSIZE(g_state.capturePath) - length, suffix);
+    SetText(g_state.outputPath, g_state.capturePath);
 }
 
 bool EqualText(const wchar_t* left, const wchar_t* right) {
@@ -267,6 +547,7 @@ void RefreshDeviceStatus() {
     CopyText(text + prefixLength, ARRAYSIZE(text) - prefixLength, result.name);
     SetText(g_state.device, text);
     SetText(g_state.format, result.hdv ? L"Format: HDV" : L"Format: DV");
+    g_state.hdv = result.hdv;
     SetText(g_state.transport, result.transport
                 ? L"Transport: available"
                 : L"Transport: unavailable");
@@ -353,7 +634,7 @@ void HandleTransportKey(wchar_t key) {
         break;
     case L'c':
     case L'C':
-        SetStatus(L"Capture requested; capture workflow is not connected yet.");
+        StartGuiCapture();
         break;
     default:
         break;
@@ -499,13 +780,19 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             SendTransportCommand(ED_MODE_REW, L"Rewind command sent.");
             return 0;
         case IdStop:
-            SendTransportCommand(ED_MODE_STOP, L"Stop command sent.");
+            if (g_state.captureRunning) {
+                StopGuiCapture();
+                SetText(g_state.progress, L"Capture stopped.");
+                SetStatus(L"Capture stopped.");
+            } else {
+                SendTransportCommand(ED_MODE_STOP, L"Stop command sent.");
+            }
             return 0;
         case IdPlay:
             SendTransportCommand(ED_MODE_PLAY, L"Play command sent.");
             return 0;
         case IdCapture:
-            SetStatus(L"Capture requested; capture workflow is not connected yet.");
+            StartGuiCapture();
             return 0;
         case IdFastForward:
             SendTransportCommand(ED_MODE_FF, L"Fast-forward command sent.");
@@ -530,9 +817,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     case WM_TIMER:
         if (wParam == 1) UpdateLiveStatus();
+        if (wParam == 1) UpdateCaptureStatus();
         return 0;
     case WM_DESTROY:
         KillTimer(window, 1);
+        StopGuiCapture();
         ReleaseCameraInterfaces();
         if (g_state.headingFont != 0) DeleteObject(g_state.headingFont);
         if (g_state.normalFont != 0) DeleteObject(g_state.normalFont);
