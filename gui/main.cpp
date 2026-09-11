@@ -7,6 +7,8 @@
 #include <commdlg.h>
 #include <dshow.h>
 
+#include "resource.h"
+
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -66,6 +68,9 @@ struct GuiState {
     DWORD captureStartTick;
     char captureOutputBuffer[8192];
     int captureOutputLength;
+    wchar_t captureVideoDuration[32];
+    bool hasDisplayedTimecode;
+    ULONG displayedTimecodeFrames;
     bool captureRunning;
 };
 
@@ -83,7 +88,7 @@ void DrainCaptureOutput();
 void SetCaptureSummary(const wchar_t* prefix);
 
 void ReleaseCameraInterfaces() {
-    if (g_timecodeReader != 0) {
+    if (g_timecodeReader != 0 && !g_state.captureRunning) {
         g_timecodeReader->Release();
         g_timecodeReader = 0;
     }
@@ -125,15 +130,21 @@ void StopGuiCapture() {
     g_state.captureInput = 0;
     g_state.captureOutput = 0;
     g_state.captureRunning = false;
-    SetCaptureSummary(L"Capture stopped;");
+    SetCaptureSummary(L"Capture finalized;");
 }
 
 void UpdateCaptureStatus() {
     if (!g_state.captureRunning) return;
     DrainCaptureOutput();
     if (WaitForSingleObject(g_state.captureProcess.hProcess, 0) != WAIT_TIMEOUT) {
+        DWORD exitCode = 1;
+        GetExitCodeProcess(g_state.captureProcess.hProcess, &exitCode);
         StopGuiCapture();
-        SetStatus(L"Capture process finished.");
+        if (exitCode == 0) {
+            SetStatus(L"Capture process finished successfully.");
+        } else {
+            SetStatus(L"Capture process failed; see the final file/partial-file state.");
+        }
         return;
     }
     LARGE_INTEGER size = {};
@@ -144,7 +155,17 @@ void UpdateCaptureStatus() {
                          GetFileSizeEx(output, &size) != FALSE;
     if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
     if (hasSize) {
-        wchar_t progress[128] = L"Capture running; bytes: ";
+        wchar_t progress[160] = L"Capture running; video duration: ";
+        int offset = 0;
+        while (progress[offset] != L'\0') ++offset;
+        CopyText(progress + offset, ARRAYSIZE(progress) - offset,
+                 g_state.captureVideoDuration[0] != L'\0'
+                     ? g_state.captureVideoDuration : L"unknown");
+        offset = 0;
+        while (progress[offset] != L'\0') ++offset;
+        CopyText(progress + offset, ARRAYSIZE(progress) - offset, L"; bytes: ");
+        offset = 0;
+        while (progress[offset] != L'\0') ++offset;
         wchar_t digits[32];
         ULONGLONG value = static_cast<ULONGLONG>(size.QuadPart);
         int count = 0;
@@ -152,7 +173,6 @@ void UpdateCaptureStatus() {
             digits[count++] = static_cast<wchar_t>(L'0' + value % 10);
             value /= 10;
         } while (value != 0 && count < ARRAYSIZE(digits));
-        int offset = 23;
         while (count != 0 && offset + 1 < ARRAYSIZE(progress)) {
             progress[offset++] = digits[--count];
         }
@@ -180,11 +200,49 @@ void ProcessCaptureOutputLine(const char* line, int length) {
         timecode += 9;
         wchar_t display[32] = L"Timecode: --:--:--:--";
         int index = 0;
+        int digits[8] = {};
         while (index < 11 && timecode + index < line + length) {
-            display[10 + index] = static_cast<unsigned char>(timecode[index]);
+            const char character = timecode[index];
+            display[10 + index] = static_cast<unsigned char>(character);
+            if (index == 0 || index == 1 || index == 3 || index == 4 ||
+                index == 6 || index == 7 || index == 9 || index == 10) {
+                if (character < '0' || character > '9') break;
+                const int digitIndex = index - (index >= 3 ? 1 : 0) -
+                                       (index >= 6 ? 1 : 0) -
+                                       (index >= 9 ? 1 : 0);
+                digits[digitIndex] = character - '0';
+            }
             ++index;
         }
-        if (index == 11) SetText(g_state.timecode, display);
+        if (index == 11) {
+            const ULONG frames = (((digits[0] * 10 + digits[1]) * 60 +
+                                   digits[2] * 10 + digits[3]) * 60 +
+                                  digits[4] * 10 + digits[5]) * 30 +
+                                 digits[6] * 10 + digits[7];
+            if (!g_state.captureRunning || !g_state.hasDisplayedTimecode ||
+                frames >= g_state.displayedTimecodeFrames) {
+                g_state.hasDisplayedTimecode = true;
+                g_state.displayedTimecodeFrames = frames;
+                SetText(g_state.timecode, display);
+            }
+        }
+    }
+    const char* duration = FindAscii(line, length, "Duration ");
+    if (duration != 0) {
+        duration += 9;
+        int index = 0;
+        while (index < 8 && duration + index < line + length) {
+            g_state.captureVideoDuration[index] =
+                static_cast<unsigned char>(duration[index]);
+            ++index;
+        }
+        if (index == 8) {
+            g_state.captureVideoDuration[index] = L'\0';
+            wchar_t progress[128] = L"Video duration: ";
+            CopyText(progress + 16, ARRAYSIZE(progress) - 16,
+                     g_state.captureVideoDuration);
+            SetText(g_state.progress, progress);
+        }
     }
 }
 
@@ -224,6 +282,15 @@ void SetCaptureSummary(const wchar_t* prefix) {
     wchar_t summary[256] = {};
     CopyText(summary, ARRAYSIZE(summary), prefix);
     int offset = 0;
+    while (summary[offset] != L'\0') ++offset;
+    CopyText(summary + offset, ARRAYSIZE(summary) - offset,
+             L" video duration: ");
+    offset = 0;
+    while (summary[offset] != L'\0') ++offset;
+    CopyText(summary + offset, ARRAYSIZE(summary) - offset,
+             g_state.captureVideoDuration[0] != L'\0'
+                 ? g_state.captureVideoDuration : L"unknown");
+    offset = 0;
     while (summary[offset] != L'\0') ++offset;
     CopyText(summary + offset, ARRAYSIZE(summary) - offset, L" bytes: ");
     offset = 0;
@@ -273,14 +340,30 @@ void StartGuiCapture() {
     }
     EnsureCaptureExtension();
     bool overwrite = false;
-    if (GetFileAttributesW(g_state.capturePath) != INVALID_FILE_ATTRIBUTES) {
+    wchar_t partialPath[MAX_PATH];
+    CopyText(partialPath, ARRAYSIZE(partialPath), g_state.capturePath);
+    int partialLength = 0;
+    while (partialPath[partialLength] != L'\0') ++partialLength;
+    CopyText(partialPath + partialLength,
+             ARRAYSIZE(partialPath) - partialLength, L".partial");
+    const bool finalExists =
+        GetFileAttributesW(g_state.capturePath) != INVALID_FILE_ATTRIBUTES;
+    const bool partialExists =
+        GetFileAttributesW(partialPath) != INVALID_FILE_ATTRIBUTES;
+    if (finalExists || partialExists) {
         const int answer = MessageBoxW(
             g_state.window,
-            L"The selected capture file already exists. Replace it?",
-            L"Capture file exists",
+            partialExists
+                ? L"An unfinished partial capture already exists. Delete it and start a new capture?"
+                : L"The selected capture file already exists. Replace it?",
+            partialExists ? L"Partial capture exists" : L"Capture file exists",
             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
         if (answer != IDYES) {
             SetStatus(L"Capture cancelled; existing file was preserved.");
+            return;
+        }
+        if (partialExists && !DeleteFileW(partialPath)) {
+            SetStatus(L"Unable to remove the previous partial capture.");
             return;
         }
         overwrite = true;
@@ -345,6 +428,7 @@ void StartGuiCapture() {
     g_state.captureInput = parentInput;
     g_state.captureOutput = parentOutput;
     g_state.captureOutputLength = 0;
+    g_state.captureVideoDuration[0] = L'\0';
     g_state.captureStartTick = GetTickCount();
     g_state.captureRunning = true;
     SetText(g_state.progress, L"Capture starting...");
@@ -590,7 +674,7 @@ void UpdateLiveStatus() {
             SetText(g_state.transport, label);
         }
     }
-    if (g_timecodeReader != 0) {
+    if (g_timecodeReader != 0 && !g_state.captureRunning) {
         TIMECODE_SAMPLE sample = {};
         sample.dwFlags = ED_DEVCAP_TIMECODE_READ;
         if (SUCCEEDED(g_timecodeReader->GetTimecode(&sample))) {
@@ -668,6 +752,11 @@ void HandleTransportKey(wchar_t key) {
 void BrowseForOutput() {
     wchar_t path[MAX_PATH] = {};
     GetWindowTextW(g_state.outputPath, path, ARRAYSIZE(path));
+    if (path[0] != L'\0') {
+        CopyText(g_state.capturePath, ARRAYSIZE(g_state.capturePath), path);
+        EnsureCaptureExtension();
+        GetWindowTextW(g_state.outputPath, path, ARRAYSIZE(path));
+    }
     OPENFILENAMEW dialog = {};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = g_state.window;
@@ -675,10 +764,12 @@ void BrowseForOutput() {
     dialog.lpstrFile = path;
     dialog.nMaxFile = ARRAYSIZE(path);
     dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
-    dialog.lpstrDefExt = L"dv";
+    dialog.lpstrDefExt = g_state.hdv ? L"m2t" : L"dv";
     if (GetSaveFileNameW(&dialog)) {
         SetText(g_state.outputPath, path);
-        SetStatus(L"Output path selected; capture backend is not connected yet.");
+        CopyText(g_state.capturePath, ARRAYSIZE(g_state.capturePath), path);
+        EnsureCaptureExtension();
+        SetStatus(L"Output path selected.");
     }
 }
 
@@ -806,7 +897,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case IdStop:
             if (g_state.captureRunning) {
                 StopGuiCapture();
-                SetText(g_state.progress, L"Capture stopped.");
                 SetStatus(L"Capture stopped.");
             } else {
                 SendTransportCommand(ED_MODE_STOP, L"Stop command sent.");
@@ -865,13 +955,16 @@ int RunGui(HINSTANCE instance, int showCommand) {
     INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
 
-    WNDCLASSW windowClass = {};
+    WNDCLASSEXW windowClass = {};
+    windowClass.cbSize = sizeof(windowClass);
     windowClass.hInstance = instance;
     windowClass.lpfnWndProc = WindowProc;
+    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_FWCAP));
+    windowClass.hIconSm = LoadIconW(instance, MAKEINTRESOURCEW(IDI_FWCAP));
     windowClass.hCursor = LoadCursorW(0, IDC_ARROW);
     windowClass.hbrBackground = CreateSolidBrush(RGB(31, 40, 52));
     windowClass.lpszClassName = L"FireWireCaptureGui";
-    if (!RegisterClassW(&windowClass)) return 1;
+    if (!RegisterClassExW(&windowClass)) return 1;
 
     g_state.window = CreateWindowExW(
         0, windowClass.lpszClassName, L"FireWire Capture",

@@ -88,6 +88,7 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="..\gui\main.cpp"><ObjectFileName>$(IntDir)gui_main.obj</ObjectFileName></ClCompile>
+    <ResourceCompile Include="..\gui\resources.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

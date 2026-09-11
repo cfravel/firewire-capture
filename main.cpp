@@ -1462,6 +1462,14 @@ int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode, bool overwrite) {
                HRESULT_FROM_WIN32(ERROR_FILE_EXISTS));
         return 1;
     }
+    if (!hdvDiscardMode && GetFileAttributesW(partialOutputPath.c_str()) !=
+                                  INVALID_FILE_ATTRIBUTES) {
+        if (!overwrite || !DeleteFileW(partialOutputPath.c_str())) {
+            Report(L"Refuse to overwrite existing partial capture file",
+                   HRESULT_FROM_WIN32(ERROR_FILE_EXISTS));
+            return 1;
+        }
+    }
     std::wcout << L"  Output path: " << capturePath << L'\n';
     hr = graph->AddFilter(camera.Get(), deviceName.c_str());
     Report(L"Add capture source to graph", hr);

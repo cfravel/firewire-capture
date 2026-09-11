@@ -1413,6 +1413,18 @@ int RunCapture(const wchar_t* outputPath,
         CoUninitialize();
         return 1;
     }
+    if (!discard && GetFileAttributesW(partialPath) != INVALID_FILE_ATTRIBUTES) {
+        if (!overwrite || !DeleteFileW(partialPath)) {
+            PrintHResult(L"Refuse to overwrite existing partial capture file",
+                         HRESULT_FROM_WIN32(ERROR_FILE_EXISTS));
+            output.Reset();
+            source.Reset();
+            control.Reset();
+            graph.Reset();
+            CoUninitialize();
+            return 1;
+        }
+    }
     Text outputText;
     outputText.Append(L"  Output path: ");
     outputText.Append(capturePath);
