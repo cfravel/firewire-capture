@@ -4,6 +4,10 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "firewire-capture", "firewire-capture.vcxproj", "{DCC25BCC-B0CF-4A1F-8312-0AD87BED5D0F}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "fwcap-gui", "gui-modern\gui-modern.vcxproj", "{C7C1B7FD-6D91-4D68-BA8B-6E75E013E0AB}"
+EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "fwcap-xp-gui", "gui-xp\gui-xp.vcxproj", "{02AC97DF-6CF2-482F-9B57-8E5AB673B10D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x86 = Debug|x86
@@ -13,7 +17,15 @@ Global
 		{DCC25BCC-B0CF-4A1F-8312-0AD87BED5D0F}.Debug|x86.ActiveCfg = Debug|Win32
 		{DCC25BCC-B0CF-4A1F-8312-0AD87BED5D0F}.Debug|x86.Build.0 = Debug|Win32
 		{DCC25BCC-B0CF-4A1F-8312-0AD87BED5D0F}.Release|x86.ActiveCfg = Release|Win32
-		{DCC25BCC-B0CF-4A1F-8312-0AD87BED5D0F}.Release|x86.Build.0 = Release|Win32
+	{DCC25BCC-B0CF-4A1F-8312-0AD87BED5D0F}.Release|x86.Build.0 = Release|Win32
+		{C7C1B7FD-6D91-4D68-BA8B-6E75E013E0AB}.Debug|x86.ActiveCfg = Debug|Win32
+		{C7C1B7FD-6D91-4D68-BA8B-6E75E013E0AB}.Debug|x86.Build.0 = Debug|Win32
+		{C7C1B7FD-6D91-4D68-BA8B-6E75E013E0AB}.Release|x86.ActiveCfg = Release|Win32
+		{C7C1B7FD-6D91-4D68-BA8B-6E75E013E0AB}.Release|x86.Build.0 = Release|Win32
+		{02AC97DF-6CF2-482F-9B57-8E5AB673B10D}.Debug|x86.ActiveCfg = Debug|Win32
+		{02AC97DF-6CF2-482F-9B57-8E5AB673B10D}.Debug|x86.Build.0 = Debug|Win32
+		{02AC97DF-6CF2-482F-9B57-8E5AB673B10D}.Release|x86.ActiveCfg = Release|Win32
+		{02AC97DF-6CF2-482F-9B57-8E5AB673B10D}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
