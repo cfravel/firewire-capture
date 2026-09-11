@@ -16,6 +16,8 @@
 #include <string>
 #include <thread>
 
+int RunGui(HINSTANCE instance, int showCommand);
+
 namespace {
 
 bool g_verbose = false;
@@ -1693,6 +1695,10 @@ int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode) {
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
+    if (argc == 1) {
+        FreeConsole();
+        return RunGui(GetModuleHandleW(nullptr), SW_SHOWNORMAL);
+    }
     int outputIndex = 0;
     int positionalCount = 0;
     bool hdvDiscardMode = false;

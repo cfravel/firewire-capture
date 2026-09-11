@@ -5,6 +5,8 @@
 #include <windows.h>
 #include <dshow.h>
 
+int RunGui(HINSTANCE instance, int showCommand);
+
 void* operator new(unsigned int size) {
     return HeapAlloc(GetProcessHeap(), 0, size);
 }
@@ -1623,6 +1625,17 @@ int ProductMain() {
 
     // Skip the executable name.
     NextArgument(&cursor, argument, ARRAYSIZE(argument));
+    const wchar_t* argumentsAfterExecutable = cursor;
+    if (!NextArgument(&argumentsAfterExecutable, argument, ARRAYSIZE(argument))) {
+        FreeConsole();
+        return RunGui(GetModuleHandleW(0), SW_SHOWNORMAL);
+    }
+    cursor = argumentsAfterExecutable;
+    // The first argument was read only to distinguish GUI mode from CLI mode.
+    // Rewind the parser to process it normally below.
+    const wchar_t* commandLineAfterExecutable = GetCommandLineW();
+    NextArgument(&commandLineAfterExecutable, argument, ARRAYSIZE(argument));
+    cursor = commandLineAfterExecutable;
     while (NextArgument(&cursor, argument, ARRAYSIZE(argument))) {
         if (wcscmp(argument, L"-v") == 0 ||
             wcscmp(argument, L"--verbose") == 0) {
