@@ -473,7 +473,7 @@ HRESULT DvDiscardFilter::OpenOutputFile(const wchar_t* path) {
         GENERIC_WRITE,
         FILE_SHARE_READ,
         nullptr,
-        CREATE_ALWAYS,
+        CREATE_NEW,
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
     if (outputFile_ == INVALID_HANDLE_VALUE) {
@@ -1398,7 +1398,7 @@ void PrintFinalSummary(CaptureKind kind,
     }
 }
 
-int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode) {
+int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode, bool overwrite) {
     ComPtr<IGraphBuilder> graph;
     HRESULT hr = CoCreateInstance(
         CLSID_FilterGraph,
@@ -1439,13 +1439,29 @@ int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode) {
     std::wstring normalizedOutputPath(outputPath);
     const wchar_t* extension = wcsrchr(normalizedOutputPath.c_str(), L'.');
     if (captureKind == CaptureKind::Dv) {
+        if (extension != nullptr && _wcsicmp(extension, L".m2t") == 0) {
+            normalizedOutputPath.erase(normalizedOutputPath.length() - 4);
+        }
         if (extension == nullptr || _wcsicmp(extension, L".dv") != 0) {
             normalizedOutputPath += L".dv";
         }
-    } else if (extension == nullptr || _wcsicmp(extension, L".m2t") != 0) {
-        normalizedOutputPath += L".m2t";
+    } else {
+        if (extension != nullptr && _wcsicmp(extension, L".dv") == 0) {
+            normalizedOutputPath.erase(normalizedOutputPath.length() - 3);
+        }
+        extension = wcsrchr(normalizedOutputPath.c_str(), L'.');
+        if (extension == nullptr || _wcsicmp(extension, L".m2t") != 0) {
+            normalizedOutputPath += L".m2t";
+        }
     }
     const wchar_t* capturePath = normalizedOutputPath.c_str();
+    std::wstring partialOutputPath = normalizedOutputPath + L".partial";
+    if (!hdvDiscardMode && !overwrite &&
+        GetFileAttributesW(capturePath) != INVALID_FILE_ATTRIBUTES) {
+        Report(L"Refuse to overwrite existing output file",
+               HRESULT_FROM_WIN32(ERROR_FILE_EXISTS));
+        return 1;
+    }
     std::wcout << L"  Output path: " << capturePath << L'\n';
     hr = graph->AddFilter(camera.Get(), deviceName.c_str());
     Report(L"Add capture source to graph", hr);
@@ -1464,7 +1480,7 @@ int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode) {
             return 1;
         }
 
-        hr = dvDiscardSink->OpenOutputFile(capturePath);
+        hr = dvDiscardSink->OpenOutputFile(partialOutputPath.c_str());
         Report(L"Create native DV output file", hr);
         if (FAILED(hr)) {
             return 1;
@@ -1507,7 +1523,7 @@ int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode) {
         if (FAILED(hr)) return 1;
 
         if (!hdvDiscardMode) {
-            hr = dvDiscardSink->OpenOutputFile(capturePath);
+            hr = dvDiscardSink->OpenOutputFile(partialOutputPath.c_str());
             Report(L"Create native HDV output file", hr);
             if (FAILED(hr)) return 1;
             outputConfigured = true;
@@ -1709,6 +1725,17 @@ int RunCapture(const wchar_t* outputPath, bool hdvDiscardMode) {
         captureKind, capturePath, dvDiscardSink, lastGoodTimecode,
         firstGoodTimecode,
         progressStarted, stopIssued, hdvDiscardMode);
+    if (!hdvDiscardMode) {
+        graph->RemoveFilter(dvSink.Get());
+        dvSink.Reset();
+        captureOutput.Reset();
+        const DWORD moveFlags = overwrite ? MOVEFILE_REPLACE_EXISTING : 0;
+        if (!MoveFileExW(partialOutputPath.c_str(), capturePath, moveFlags)) {
+            Report(L"Finalize partial capture file",
+                   HRESULT_FROM_WIN32(GetLastError()));
+            return 1;
+        }
+    }
     return FAILED(hr) ? 1 : 0;
 }
 
@@ -1722,11 +1749,14 @@ int wmain(int argc, wchar_t* argv[]) {
     int outputIndex = 0;
     int positionalCount = 0;
     bool hdvDiscardMode = false;
+    bool overwrite = false;
     for (int index = 1; index < argc; ++index) {
         if (wcscmp(argv[index], L"-v") == 0) {
             g_verbose = true;
         } else if (wcscmp(argv[index], L"--hdv-discard") == 0) {
             hdvDiscardMode = true;
+        } else if (wcscmp(argv[index], L"--overwrite") == 0) {
+            overwrite = true;
         } else if (positionalCount == 0) {
             outputIndex = index;
             positionalCount = 1;
@@ -1735,7 +1765,7 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
     if (outputIndex == 0 || positionalCount != 1 || argc < 2) {
-        std::wcerr << L"Usage: fwcap.exe [-v] [--hdv-discard] "
+        std::wcerr << L"Usage: fwcap.exe [-v] [--overwrite] [--hdv-discard] "
                    << L"<output.m2t|output.dv>\n";
         return 2;
     }
@@ -1746,7 +1776,7 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    const int result = RunCapture(argv[outputIndex], hdvDiscardMode);
+    const int result = RunCapture(argv[outputIndex], hdvDiscardMode, overwrite);
     CoUninitialize();
     if (g_verbose) {
         std::wcout << L"[OK] Uninitialize COM: completed\n";

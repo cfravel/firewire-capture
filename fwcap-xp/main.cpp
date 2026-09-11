@@ -304,7 +304,7 @@ public:
 
     HRESULT Open(const wchar_t* path) {
         outputFile_ = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, 0,
-                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+                                  CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
         return outputFile_ == INVALID_HANDLE_VALUE ? HRESULT_FROM_WIN32(GetLastError())
                                                     : S_OK;
     }
@@ -1052,7 +1052,16 @@ HRESULT NormalizeCapturePath(const wchar_t* requested,
     }
     result[length] = L'\0';
     const wchar_t* suffix = kind == CaptureKind::Dv ? L".dv" : L".m2t";
-    if (EndsWithInsensitive(result, suffix)) return S_OK;
+    if (kind == CaptureKind::Hdv && EndsWithInsensitive(result, L".dv")) {
+        length -= 3;
+        result[length] = L'\0';
+    } else if (kind == CaptureKind::Dv &&
+               EndsWithInsensitive(result, L".m2t")) {
+        length -= 4;
+        result[length] = L'\0';
+    } else if (EndsWithInsensitive(result, suffix)) {
+        return S_OK;
+    }
     ULONG suffixLength = 0;
     while (suffix[suffixLength] != L'\0') ++suffixLength;
     if (length + suffixLength + 1 > capacity) {
@@ -1327,7 +1336,8 @@ const wchar_t* WaitForProductStop(CaptureKind kind,
 int RunCapture(const wchar_t* outputPath,
                bool indefinite = false,
                bool discard = false,
-               bool verbose = false) {
+               bool verbose = false,
+               bool overwrite = false) {
     g_productVerbose = verbose;
     HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
@@ -1386,6 +1396,23 @@ int RunCapture(const wchar_t* outputPath,
         CoUninitialize();
         return 1;
     }
+    wchar_t partialPath[1024];
+    wcscpy_s(partialPath, ARRAYSIZE(partialPath), capturePath);
+    ULONG partialLength = 0;
+    while (partialPath[partialLength] != L'\0') ++partialLength;
+    wcscpy_s(partialPath + partialLength,
+             ARRAYSIZE(partialPath) - partialLength, L".partial");
+    if (!discard && !overwrite &&
+        GetFileAttributesW(capturePath) != INVALID_FILE_ATTRIBUTES) {
+        PrintHResult(L"Refuse to overwrite existing output file",
+                     HRESULT_FROM_WIN32(ERROR_FILE_EXISTS));
+        output.Reset();
+        source.Reset();
+        control.Reset();
+        graph.Reset();
+        CoUninitialize();
+        return 1;
+    }
     Text outputText;
     outputText.Append(L"  Output path: ");
     outputText.Append(capturePath);
@@ -1406,7 +1433,7 @@ int RunCapture(const wchar_t* outputPath,
     if (discard && kind == CaptureKind::Hdv) {
         sink->SetDiscard();
     } else {
-        hr = sink->Open(capturePath);
+        hr = sink->Open(partialPath);
         if (FAILED(hr)) {
             PrintHResult(L"Open output file", hr);
             sink.Reset();
@@ -1595,6 +1622,21 @@ int RunCapture(const wchar_t* outputPath,
         result.Flush();
     }
 
+    bool finalized = true;
+    if (!discard) {
+        graph->RemoveFilter(sink.Get());
+        sink.Reset();
+        input.Reset();
+        output.Reset();
+        source.Reset();
+        const DWORD moveFlags = overwrite ? MOVEFILE_REPLACE_EXISTING : 0;
+        finalized = MoveFileExW(partialPath, capturePath, moveFlags) != FALSE;
+        if (!finalized) {
+            PrintHResult(L"Finalize partial capture file",
+                         HRESULT_FROM_WIN32(GetLastError()));
+        }
+    }
+
     transport.Reset();
     events.Reset();
     input.Reset();
@@ -1604,7 +1646,7 @@ int RunCapture(const wchar_t* outputPath,
     control.Reset();
     graph.Reset();
     CoUninitialize();
-    return FAILED(hr) ? 1 : 0;
+    return FAILED(hr) || !finalized ? 1 : 0;
 }
 
 bool NextArgument(const wchar_t** cursor, wchar_t* argument, ULONG capacity) {
@@ -1640,6 +1682,7 @@ int ProductMain() {
     outputPath[0] = L'\0';
     bool verbose = false;
     bool hdvDiscard = false;
+    bool overwrite = false;
     ULONG positional = 0;
 
     // Skip the executable name.
@@ -1661,23 +1704,25 @@ int ProductMain() {
             verbose = true;
         } else if (wcscmp(argument, L"--hdv-discard") == 0) {
             hdvDiscard = true;
+        } else if (wcscmp(argument, L"--overwrite") == 0) {
+            overwrite = true;
         } else if (positional == 0) {
             wcscpy_s(outputPath, ARRAYSIZE(outputPath), argument);
             positional = 1;
         } else {
-            PrintLine(L"Usage: fwcap-xp.exe [-v] [--hdv-discard] <capture-name>");
+            PrintLine(L"Usage: fwcap-xp.exe [-v] [--overwrite] [--hdv-discard] <capture-name>");
             return 2;
         }
     }
 
     if (positional != 1) {
-        PrintLine(L"Usage: fwcap-xp.exe [-v] [--hdv-discard] <capture-name>");
+        PrintLine(L"Usage: fwcap-xp.exe [-v] [--overwrite] [--hdv-discard] <capture-name>");
         return 2;
     }
     g_productMode = true;
     g_productVerbose = verbose;
     if (verbose) PrintLine(L"fwcap-xp: verbose capture diagnostics enabled.");
-    return RunCapture(outputPath, true, hdvDiscard, verbose);
+    return RunCapture(outputPath, true, hdvDiscard, verbose, overwrite);
 }
 #endif
 

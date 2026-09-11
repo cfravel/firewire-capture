@@ -272,6 +272,19 @@ void StartGuiCapture() {
         return;
     }
     EnsureCaptureExtension();
+    bool overwrite = false;
+    if (GetFileAttributesW(g_state.capturePath) != INVALID_FILE_ATTRIBUTES) {
+        const int answer = MessageBoxW(
+            g_state.window,
+            L"The selected capture file already exists. Replace it?",
+            L"Capture file exists",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (answer != IDYES) {
+            SetStatus(L"Capture cancelled; existing file was preserved.");
+            return;
+        }
+        overwrite = true;
+    }
 
     wchar_t executablePath[MAX_PATH] = {};
     const DWORD pathLength = GetModuleFileNameW(
@@ -285,7 +298,7 @@ void StartGuiCapture() {
     int length = 1;
     while (commandLine[length] != L'\0') ++length;
     CopyText(commandLine + length, ARRAYSIZE(commandLine) - length,
-             L"\" -v \"");
+             overwrite ? L"\" -v --overwrite \"" : L"\" -v \"");
     length = 0;
     while (commandLine[length] != L'\0') ++length;
     CopyText(commandLine + length, ARRAYSIZE(commandLine) - length,
@@ -413,8 +426,18 @@ bool GuiEndsWithInsensitive(const wchar_t* text, const wchar_t* suffix) {
 
 void EnsureCaptureExtension() {
     const wchar_t* suffix = g_state.hdv ? L".m2t" : L".dv";
-    if ((g_state.hdv && GuiEndsWithInsensitive(g_state.capturePath, L".m2t")) ||
-        (!g_state.hdv && GuiEndsWithInsensitive(g_state.capturePath, L".dv"))) {
+    if (g_state.hdv && GuiEndsWithInsensitive(g_state.capturePath, L".dv")) {
+        int length = 0;
+        while (g_state.capturePath[length] != L'\0') ++length;
+        g_state.capturePath[length - 3] = L'\0';
+    } else if (!g_state.hdv &&
+               GuiEndsWithInsensitive(g_state.capturePath, L".m2t")) {
+        int length = 0;
+        while (g_state.capturePath[length] != L'\0') ++length;
+        g_state.capturePath[length - 4] = L'\0';
+    } else if ((g_state.hdv && GuiEndsWithInsensitive(g_state.capturePath, L".m2t")) ||
+               (!g_state.hdv && GuiEndsWithInsensitive(g_state.capturePath, L".dv"))) {
+        SetText(g_state.outputPath, g_state.capturePath);
         return;
     }
     int length = 0;
@@ -569,6 +592,7 @@ void UpdateLiveStatus() {
     }
     if (g_timecodeReader != 0) {
         TIMECODE_SAMPLE sample = {};
+        sample.dwFlags = ED_DEVCAP_TIMECODE_READ;
         if (SUCCEEDED(g_timecodeReader->GetTimecode(&sample))) {
             const DWORD value = sample.timecode.dwFrames;
             const int hours = ((value >> 28) & 0x0F) * 10 + ((value >> 24) & 0x0F);
