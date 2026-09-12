@@ -58,6 +58,7 @@ struct GuiState {
     HWND previewWindow;
     HFONT headingFont;
     HFONT normalFont;
+    HFONT buttonFont;
     HBRUSH backgroundBrush;
     HBRUSH panelBrush;
     bool previewEnabled;
@@ -862,8 +863,10 @@ HWND MakeControl(const wchar_t* className,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         g_state.instance, 0);
     if (control != 0) {
+        HFONT font = className[0] == L'B' && id != IdPreview
+                         ? g_state.buttonFont : g_state.normalFont;
         SendMessageW(control, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(g_state.normalFont), TRUE);
+                     reinterpret_cast<WPARAM>(font), TRUE);
     }
     return control;
 }
@@ -925,7 +928,7 @@ void BrowseForOutput() {
 
 void LayoutControls(int width, int height) {
     const int margin = 18;
-    const int infoWidth = width > 1000 ? 330 : 300;
+    const int infoWidth = width > 1000 ? 330 : (width > 800 ? 300 : 190);
     const int previewLeft = margin + infoWidth + 18;
     const int previewTop = margin;
     const int bottomHeight = 112;
@@ -955,6 +958,19 @@ void LayoutControls(int width, int height) {
         GetDlgItem(g_state.window, IdRewind), GetDlgItem(g_state.window, IdStop),
         GetDlgItem(g_state.window, IdPlay), GetDlgItem(g_state.window, IdCapture),
         GetDlgItem(g_state.window, IdFastForward)};
+    if (buttonWidth < 110) {
+        SetText(buttons[0], L"Rew [R]");
+        SetText(buttons[1], L"Stop [S]");
+        SetText(buttons[2], L"Play [P]");
+        SetText(buttons[3], L"Cap [C]");
+        SetText(buttons[4], L"FF [F]");
+    } else {
+        SetText(buttons[0], L"Rewind [R]");
+        SetText(buttons[1], L"Stop [S]");
+        SetText(buttons[2], L"Play [P]");
+        SetText(buttons[3], L"Capture [C]");
+        SetText(buttons[4], L"Fast-forward [F]");
+    }
     for (int index = 0; index < 5; ++index) {
         MoveWindow(buttons[index], previewLeft + index * (buttonWidth + 5),
                    controlsTop, buttonWidth, 30, TRUE);
@@ -983,11 +999,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             -15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Tahoma");
+        g_state.buttonFont = CreateFontW(
+            -13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Tahoma");
         g_state.backgroundBrush = CreateSolidBrush(RGB(31, 40, 52));
         g_state.panelBrush = CreateSolidBrush(RGB(8, 12, 17));
 
         g_state.device = MakeControl(L"STATIC", L"No FireWire camera detected",
-                                      WS_CHILD | WS_VISIBLE, 0, IdDevice,
+                                      WS_CHILD | WS_VISIBLE | SS_LEFT |
+                                          SS_NOPREFIX | SS_ENDELLIPSIS,
+                                      0, IdDevice,
                                       138, 22, 400, 24);
         g_state.format = MakeControl(L"STATIC", L"Format: unknown",
                                      WS_CHILD | WS_VISIBLE, 0, IdFormat,
@@ -1009,15 +1031,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             WS_CHILD | WS_VISIBLE | SS_CENTER | SS_BLACKRECT,
             0, 2000, 18, 148, 700, 250);
 
-        MakeControl(L"BUTTON", L"Rewind", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        MakeControl(L"BUTTON", L"Rewind [R]", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                     0, IdRewind, 18, 410, 100, 30);
-        MakeControl(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        MakeControl(L"BUTTON", L"Stop [S]", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                     0, IdStop, 18, 410, 100, 30);
-        MakeControl(L"BUTTON", L"Play", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        MakeControl(L"BUTTON", L"Play [P]", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                     0, IdPlay, 18, 410, 100, 30);
-        MakeControl(L"BUTTON", L"Capture", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        MakeControl(L"BUTTON", L"Capture [C]", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                     0, IdCapture, 18, 410, 100, 30);
-        MakeControl(L"BUTTON", L"Fast-forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        MakeControl(L"BUTTON", L"Fast-forward [F]", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                     0, IdFastForward, 18, 410, 100, 30);
         MakeControl(L"STATIC", L"Output:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                     0, 2100, 18, 450, 100, 24);
@@ -1043,8 +1065,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         return 0;
     case WM_GETMINMAXINFO: {
         MINMAXINFO* limits = reinterpret_cast<MINMAXINFO*>(lParam);
-        limits->ptMinTrackSize.x = 900;
-        limits->ptMinTrackSize.y = 650;
+        limits->ptMinTrackSize.x = 640;
+        limits->ptMinTrackSize.y = 480;
         return 0;
     }
     case WM_KEYDOWN:
@@ -1113,6 +1135,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         ReleaseCameraInterfaces();
         if (g_state.headingFont != 0) DeleteObject(g_state.headingFont);
         if (g_state.normalFont != 0) DeleteObject(g_state.normalFont);
+        if (g_state.buttonFont != 0) DeleteObject(g_state.buttonFont);
         if (g_state.backgroundBrush != 0) DeleteObject(g_state.backgroundBrush);
         if (g_state.panelBrush != 0) DeleteObject(g_state.panelBrush);
         PostQuitMessage(0);
