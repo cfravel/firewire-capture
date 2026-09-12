@@ -55,6 +55,7 @@ struct GuiState {
     HWND outputPath;
     HWND progress;
     HWND status;
+    HWND previewWindow;
     HFONT headingFont;
     HFONT normalFont;
     HBRUSH backgroundBrush;
@@ -78,6 +79,10 @@ GuiState g_state = {};
 IBaseFilter* g_cameraFilter = 0;
 IAMExtTransport* g_transport = 0;
 IAMTimecodeReader* g_timecodeReader = 0;
+IGraphBuilder* g_previewGraph = 0;
+IMediaControl* g_previewControl = 0;
+IVideoWindow* g_previewVideoWindow = 0;
+IBasicVideo2* g_previewBasicVideo = 0;
 
 void SetText(HWND control, const wchar_t* text);
 void SetStatus(const wchar_t* text);
@@ -86,6 +91,7 @@ void CopyText(wchar_t* destination, int capacity, const wchar_t* source);
 void EnsureCaptureExtension();
 void DrainCaptureOutput();
 void SetCaptureSummary(const wchar_t* prefix);
+bool EqualText(const wchar_t* left, const wchar_t* right);
 
 void ReleaseCameraInterfaces() {
     if (g_timecodeReader != 0 && !g_state.captureRunning) {
@@ -108,6 +114,143 @@ void FormatTwoDigits(wchar_t* output, int offset, int value) {
 }
 
 void UpdateLiveStatus();
+void StopDvPreview();
+
+IPin* FindOutputPin(IBaseFilter* filter, const wchar_t* name) {
+    if (filter == 0) return 0;
+    IEnumPins* pins = 0;
+    if (FAILED(filter->EnumPins(&pins)) || pins == 0) return 0;
+    IPin* result = 0;
+    IPin* pin = 0;
+    while (pins->Next(1, &pin, 0) == S_OK) {
+        PIN_DIRECTION direction = PINDIR_INPUT;
+        PIN_INFO info = {};
+        pin->QueryDirection(&direction);
+        pin->QueryPinInfo(&info);
+        if (info.pFilter != 0) info.pFilter->Release();
+        if (direction == PINDIR_OUTPUT && EqualText(info.achName, name)) {
+            result = pin;
+            break;
+        }
+        pin->Release();
+        pin = 0;
+    }
+    if (pin != 0 && result == 0) pin->Release();
+    pins->Release();
+    return result;
+}
+
+void ResizeDvPreview() {
+    if (g_previewVideoWindow == 0 || g_state.previewWindow == 0) return;
+    RECT rectangle = {};
+    GetClientRect(g_state.previewWindow, &rectangle);
+    long aspectX = 0;
+    long aspectY = 0;
+    if (g_previewBasicVideo != 0) {
+        g_previewBasicVideo->GetPreferredAspectRatio(&aspectX, &aspectY);
+    }
+    if (aspectX <= 0 || aspectY <= 0) {
+        long width = 0;
+        long height = 0;
+        if (g_previewBasicVideo == 0 ||
+            FAILED(g_previewBasicVideo->GetVideoSize(&width, &height)) ||
+            width <= 0 || height <= 0) {
+            aspectX = 4;
+            aspectY = 3;
+        } else {
+            aspectX = width;
+            aspectY = height;
+        }
+    }
+    int targetWidth = rectangle.right - rectangle.left;
+    int targetHeight = targetWidth * aspectY / aspectX;
+    if (targetHeight > rectangle.bottom - rectangle.top) {
+        targetHeight = rectangle.bottom - rectangle.top;
+        targetWidth = targetHeight * aspectX / aspectY;
+    }
+    const int left = ((rectangle.right - rectangle.left) - targetWidth) / 2;
+    const int top = ((rectangle.bottom - rectangle.top) - targetHeight) / 2;
+    g_previewVideoWindow->SetWindowPosition(left, top, targetWidth, targetHeight);
+}
+
+void StartDvPreview() {
+    if (g_state.hdv) {
+        SetStatus(L"HDV preview is not implemented yet; native capture remains available.");
+        CheckDlgButton(g_state.window, IdPreview, BST_UNCHECKED);
+        g_state.previewEnabled = false;
+        return;
+    }
+    if (g_cameraFilter == 0) {
+        SetStatus(L"DV preview unavailable because no camera is detected.");
+        CheckDlgButton(g_state.window, IdPreview, BST_UNCHECKED);
+        g_state.previewEnabled = false;
+        return;
+    }
+    StopDvPreview();
+    HRESULT hr = CoCreateInstance(
+        CLSID_FilterGraph, 0, CLSCTX_INPROC_SERVER, IID_IGraphBuilder,
+        reinterpret_cast<void**>(&g_previewGraph));
+    if (SUCCEEDED(hr)) {
+        hr = g_previewGraph->AddFilter(g_cameraFilter, L"DV preview source");
+    }
+    IPin* videoPin = SUCCEEDED(hr) ? FindOutputPin(g_cameraFilter, L"DV A/V Out") : 0;
+    if (SUCCEEDED(hr) && videoPin != 0) {
+        hr = g_previewGraph->Render(videoPin);
+        videoPin->Release();
+    } else if (SUCCEEDED(hr)) {
+        hr = VFW_E_NOT_FOUND;
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g_previewGraph->QueryInterface(
+            IID_IMediaControl, reinterpret_cast<void**>(&g_previewControl));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g_previewGraph->QueryInterface(
+            IID_IVideoWindow, reinterpret_cast<void**>(&g_previewVideoWindow));
+    }
+    if (SUCCEEDED(hr)) {
+        g_previewGraph->QueryInterface(
+            IID_IBasicVideo2, reinterpret_cast<void**>(&g_previewBasicVideo));
+    }
+    if (SUCCEEDED(hr)) {
+        g_previewVideoWindow->put_Owner(
+            reinterpret_cast<OAHWND>(g_state.previewWindow));
+        g_previewVideoWindow->put_WindowStyle(WS_CHILD | WS_CLIPSIBLINGS);
+        g_previewVideoWindow->put_Visible(OATRUE);
+        ResizeDvPreview();
+        hr = g_previewControl->Run();
+    }
+    if (FAILED(hr)) {
+        StopDvPreview();
+        CheckDlgButton(g_state.window, IdPreview, BST_UNCHECKED);
+        g_state.previewEnabled = false;
+        SetStatus(L"DV preview could not be started; capture remains available.");
+        return;
+    }
+    SetStatus(L"DV preview is running.");
+}
+
+void StopDvPreview() {
+    if (g_previewVideoWindow != 0) {
+        g_previewVideoWindow->put_Visible(OAFALSE);
+        g_previewVideoWindow->put_Owner(0);
+        g_previewVideoWindow->Release();
+        g_previewVideoWindow = 0;
+    }
+    if (g_previewBasicVideo != 0) {
+        g_previewBasicVideo->Release();
+        g_previewBasicVideo = 0;
+    }
+    if (g_previewControl != 0) {
+        g_previewControl->Stop();
+        g_previewControl->Release();
+        g_previewControl = 0;
+    }
+    if (g_previewGraph != 0) {
+        g_previewGraph->Release();
+        g_previewGraph = 0;
+    }
+}
 
 void StopGuiCapture() {
     if (!g_state.captureRunning) return;
@@ -327,6 +470,11 @@ void StartGuiCapture() {
         SetStatus(L"Capture is already running.");
         return;
     }
+    const bool restartPreview = g_state.previewEnabled;
+    if (restartPreview) {
+        StopDvPreview();
+        SetStatus(L"Preview stopped while capture is starting.");
+    }
     GetWindowTextW(g_state.outputPath, g_state.capturePath,
                    ARRAYSIZE(g_state.capturePath));
     if (g_state.capturePath[0] == L'\0') {
@@ -402,6 +550,7 @@ void StartGuiCapture() {
         if (childOutput != 0) CloseHandle(childOutput);
         if (parentOutput != 0) CloseHandle(parentOutput);
         SetStatus(L"Unable to create capture control pipe.");
+        if (restartPreview) StartDvPreview();
         return;
     }
     SetHandleInformation(parentInput, HANDLE_FLAG_INHERIT, 0);
@@ -420,6 +569,7 @@ void StartGuiCapture() {
         CloseHandle(childOutput);
         CloseHandle(parentOutput);
         SetStatus(L"Unable to start capture process.");
+        if (restartPreview) StartDvPreview();
         return;
     }
     CloseHandle(childInput);
@@ -775,39 +925,50 @@ void BrowseForOutput() {
 
 void LayoutControls(int width, int height) {
     const int margin = 18;
-    const int labelWidth = 120;
-    const int valueX = margin + labelWidth;
-    const int valueWidth = width - valueX - margin;
-    const int previewTop = 148;
-    const int previewHeight = height - 390;
+    const int infoWidth = width > 1000 ? 330 : 300;
+    const int previewLeft = margin + infoWidth + 18;
+    const int previewTop = margin;
+    const int bottomHeight = 112;
+    const int previewMaxHeight = height - bottomHeight - previewTop - margin;
 
-    MoveWindow(g_state.device, valueX, 22, valueWidth, 24, TRUE);
-    MoveWindow(g_state.format, valueX, 52, valueWidth / 2 - 6, 24, TRUE);
-    MoveWindow(g_state.transport, valueX + valueWidth / 2 + 6, 52,
-               valueWidth / 2 - 6, 24, TRUE);
-    MoveWindow(g_state.timecode, valueX, 82, valueWidth / 2 - 6, 24, TRUE);
-    MoveWindow(g_state.recordingDate, valueX + valueWidth / 2 + 6, 82,
-               valueWidth / 2 - 6, 24, TRUE);
-    MoveWindow(g_state.preview, margin, 116, 180, 24, TRUE);
-    MoveWindow(GetDlgItem(g_state.window, 2000), margin, previewTop,
-               width - margin * 2, previewHeight > 80 ? previewHeight : 80, TRUE);
+    MoveWindow(g_state.device, margin, 24, infoWidth, 28, TRUE);
+    MoveWindow(g_state.format, margin, 64, infoWidth, 28, TRUE);
+    MoveWindow(g_state.transport, margin, 104, infoWidth, 28, TRUE);
+    MoveWindow(g_state.timecode, margin, 144, infoWidth, 28, TRUE);
+    MoveWindow(g_state.recordingDate, margin, 184, infoWidth, 28, TRUE);
+    MoveWindow(g_state.preview, margin, 230, infoWidth, 24, TRUE);
+    const int aspectX = g_state.hdv ? 16 : 4;
+    const int aspectY = g_state.hdv ? 9 : 3;
+    int previewWidth = width - previewLeft - margin;
+    int previewHeight = previewWidth * aspectY / aspectX;
+    const int maxHeight = previewMaxHeight > 80 ? previewMaxHeight : 80;
+    if (previewHeight > maxHeight) {
+        previewHeight = maxHeight;
+        previewWidth = previewHeight * aspectX / aspectY;
+    }
+    MoveWindow(g_state.previewWindow, previewLeft, previewTop,
+               previewWidth, previewHeight, TRUE);
 
-    const int controlsTop = previewTop + (previewHeight > 80 ? previewHeight : 80) + 14;
-    const int buttonWidth = (width - margin * 2 - 20) / 5;
+    const int controlsTop = height - 92;
+    const int buttonWidth = (previewWidth - 20) / 5;
     HWND buttons[] = {
         GetDlgItem(g_state.window, IdRewind), GetDlgItem(g_state.window, IdStop),
         GetDlgItem(g_state.window, IdPlay), GetDlgItem(g_state.window, IdCapture),
         GetDlgItem(g_state.window, IdFastForward)};
     for (int index = 0; index < 5; ++index) {
-        MoveWindow(buttons[index], margin + index * (buttonWidth + 5),
+        MoveWindow(buttons[index], previewLeft + index * (buttonWidth + 5),
                    controlsTop, buttonWidth, 30, TRUE);
     }
-    const int outputTop = controlsTop + 44;
-    MoveWindow(g_state.outputPath, valueX, outputTop, valueWidth - 92, 25, TRUE);
+    const int outputTop = height - 48;
+    const int outputX = margin + 82;
+    MoveWindow(GetDlgItem(g_state.window, 2100), margin, outputTop, 76, 25, TRUE);
+    MoveWindow(g_state.outputPath, outputX, outputTop,
+               width - outputX - margin - 92, 25, TRUE);
     MoveWindow(GetDlgItem(g_state.window, IdBrowse), width - margin - 82,
                outputTop, 82, 25, TRUE);
-    MoveWindow(g_state.progress, margin, outputTop + 42, width - margin * 2, 22, TRUE);
-    MoveWindow(g_state.status, margin, outputTop + 72, width - margin * 2, 42, TRUE);
+    MoveWindow(g_state.progress, margin, 274, infoWidth, 44, TRUE);
+    MoveWindow(g_state.status, margin, 324, infoWidth, 48, TRUE);
+    InvalidateRect(g_state.status, 0, TRUE);
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -843,9 +1004,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         g_state.preview = MakeControl(L"BUTTON", L"Enable video preview",
                                       WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                                       0, IdPreview, 18, 116, 180, 24);
-        MakeControl(L"STATIC", L"Preview unavailable until capture backend is connected",
-                    WS_CHILD | WS_VISIBLE | SS_CENTER | SS_OWNERDRAW,
-                    0, 2000, 18, 148, 700, 250);
+        g_state.previewWindow = MakeControl(
+            L"STATIC", L"DV preview disabled",
+            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_BLACKRECT,
+            0, 2000, 18, 148, 700, 250);
 
         MakeControl(L"BUTTON", L"Rewind", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                     0, IdRewind, 18, 410, 100, 30);
@@ -857,7 +1019,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     0, IdCapture, 18, 410, 100, 30);
         MakeControl(L"BUTTON", L"Fast-forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                     0, IdFastForward, 18, 410, 100, 30);
-        MakeControl(L"STATIC", L"Output:", WS_CHILD | WS_VISIBLE,
+        MakeControl(L"STATIC", L"Output:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                     0, 2100, 18, 450, 100, 24);
         g_state.outputPath = MakeControl(
             L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
@@ -868,7 +1030,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                                        WS_CHILD | WS_VISIBLE, 0, IdProgress,
                                        18, 492, 700, 22);
         g_state.status = MakeControl(L"STATIC", L"Phase 1 shell: capture backend not connected",
-                                     WS_CHILD | WS_VISIBLE, 0, IdStatus,
+                                     WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                     0, IdStatus,
                                      18, 522, 700, 42);
         SetWindowTextW(g_state.window, L"FireWire Capture");
         SetTimer(g_state.window, 1, 500, 0);
@@ -876,7 +1039,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     case WM_SIZE:
         LayoutControls(LOWORD(lParam), HIWORD(lParam));
+        ResizeDvPreview();
         return 0;
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        limits->ptMinTrackSize.x = 900;
+        limits->ptMinTrackSize.y = 650;
+        return 0;
+    }
     case WM_KEYDOWN:
         HandleTransportKey(static_cast<wchar_t>(wParam));
         return 0;
@@ -887,9 +1057,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         case IdPreview:
             g_state.previewEnabled = IsDlgButtonChecked(window, IdPreview) == BST_CHECKED;
-            SetStatus(g_state.previewEnabled
-                          ? L"Preview requested; capture backend is not connected yet."
-                          : L"Video preview disabled.");
+            if (g_state.previewEnabled) {
+                StartDvPreview();
+            } else {
+                StopDvPreview();
+                SetStatus(L"Video preview disabled.");
+            }
             return 0;
         case IdRewind:
             SendTransportCommand(ED_MODE_REW, L"Rewind command sent.");
@@ -936,6 +1109,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_DESTROY:
         KillTimer(window, 1);
         StopGuiCapture();
+        StopDvPreview();
         ReleaseCameraInterfaces();
         if (g_state.headingFont != 0) DeleteObject(g_state.headingFont);
         if (g_state.normalFont != 0) DeleteObject(g_state.normalFont);
@@ -982,6 +1156,10 @@ int RunGui(HINSTANCE instance, int showCommand) {
 
     MSG message;
     while (GetMessageW(&message, 0, 0, 0) > 0) {
+        if (message.message == WM_KEYDOWN && message.hwnd != g_state.window &&
+            GetFocus() != g_state.outputPath) {
+            HandleTransportKey(static_cast<wchar_t>(message.wParam));
+        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
