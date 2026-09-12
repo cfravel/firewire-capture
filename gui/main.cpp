@@ -56,7 +56,6 @@ struct GuiState {
     HWND progress;
     HWND status;
     HWND previewWindow;
-    HWND previewMessage;
     HFONT headingFont;
     HFONT normalFont;
     HFONT compactFont;
@@ -118,6 +117,7 @@ void FormatTwoDigits(wchar_t* output, int offset, int value) {
 }
 
 void UpdateLiveStatus();
+void StartDvPreview();
 void StopDvPreview();
 
 IPin* FindOutputPin(IBaseFilter* filter, const wchar_t* name) {
@@ -175,49 +175,15 @@ void ResizeDvPreview() {
     const int left = ((rectangle.right - rectangle.left) - targetWidth) / 2;
     const int top = ((rectangle.bottom - rectangle.top) - targetHeight) / 2;
     g_previewVideoWindow->SetWindowPosition(left, top, targetWidth, targetHeight);
-    if (g_state.previewMessage != 0) {
-        const bool messageVisible = IsWindowVisible(g_state.previewMessage) != FALSE;
-        MoveWindow(g_state.previewMessage, left, top, targetWidth, targetHeight, TRUE);
-        if (messageVisible) {
-            SetWindowPos(g_state.previewMessage, HWND_TOP, left, top,
-                         targetWidth, targetHeight, SWP_SHOWWINDOW);
-        }
-    }
-}
-
-void SetPreviewMessage(const wchar_t* message, bool visible) {
-    if (g_state.previewMessage == 0) return;
-    SetText(g_state.previewMessage, message);
-    ShowWindow(g_state.previewMessage, visible ? SW_SHOW : SW_HIDE);
-    if (visible) SetWindowPos(g_state.previewMessage, HWND_TOP, 0, 0, 0, 0,
-                              SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-}
-
-bool PreviewGraphHasMpegDecoder() {
-    if (g_previewGraph == 0) return false;
-    IEnumFilters* filters = 0;
-    if (FAILED(g_previewGraph->EnumFilters(&filters)) || filters == 0) return false;
-    bool found = false;
-    IBaseFilter* filter = 0;
-    while (!found && filters->Next(1, &filter, 0) == S_OK) {
-        FILTER_INFO info = {};
-        if (SUCCEEDED(filter->QueryFilterInfo(&info))) {
-            const bool decoder = GuiContainsInsensitive(info.achName, L"decoder");
-            const bool mpeg = GuiContainsInsensitive(info.achName, L"mpeg") ||
-                              GuiContainsInsensitive(info.achName, L"video");
-            found = decoder && mpeg;
-            if (info.pGraph != 0) info.pGraph->Release();
-        }
-        filter->Release();
-        filter = 0;
-    }
-    filters->Release();
-    return found;
 }
 
 void StartDvPreview() {
-    SetPreviewMessage(L"", false);
-    ShowWindow(g_state.previewWindow, SW_SHOW);
+    if (g_state.hdv) {
+        CheckDlgButton(g_state.window, IdPreview, BST_UNCHECKED);
+        g_state.previewEnabled = false;
+        SetStatus(L"HDV preview is not supported; use the camcorder display. Native capture remains available.");
+        return;
+    }
     if (g_cameraFilter == 0) {
         SetStatus(L"DV preview unavailable because no camera is detected.");
         CheckDlgButton(g_state.window, IdPreview, BST_UNCHECKED);
@@ -225,13 +191,14 @@ void StartDvPreview() {
         return;
     }
     StopDvPreview();
+    ShowWindow(g_state.previewWindow, SW_SHOW);
     HRESULT hr = CoCreateInstance(
         CLSID_FilterGraph, 0, CLSCTX_INPROC_SERVER, IID_IGraphBuilder,
         reinterpret_cast<void**>(&g_previewGraph));
     if (SUCCEEDED(hr)) {
         hr = g_previewGraph->AddFilter(g_cameraFilter, L"DV preview source");
     }
-    const wchar_t* previewPinName = g_state.hdv ? L"MPEG2TS Out" : L"DV A/V Out";
+    const wchar_t* previewPinName = L"DV A/V Out";
     IPin* videoPin = SUCCEEDED(hr)
                          ? FindOutputPin(g_cameraFilter, previewPinName)
                          : 0;
@@ -254,14 +221,6 @@ void StartDvPreview() {
             IID_IBasicVideo2, reinterpret_cast<void**>(&g_previewBasicVideo));
     }
     if (SUCCEEDED(hr)) {
-        if (g_state.hdv && !PreviewGraphHasMpegDecoder()) {
-            StopDvPreview();
-            CheckDlgButton(g_state.window, IdPreview, BST_UNCHECKED);
-            g_state.previewEnabled = false;
-            SetPreviewMessage(L"HDV preview unavailable:\nno MPEG-2 video decoder available.", true);
-            SetStatus(L"HDV preview unavailable: no MPEG-2 video decoder available.");
-            return;
-        }
         g_previewVideoWindow->put_Owner(
             reinterpret_cast<OAHWND>(g_state.previewWindow));
         g_previewVideoWindow->put_WindowStyle(WS_CHILD | WS_CLIPSIBLINGS);
@@ -273,14 +232,10 @@ void StartDvPreview() {
         StopDvPreview();
         CheckDlgButton(g_state.window, IdPreview, BST_UNCHECKED);
         g_state.previewEnabled = false;
-        SetPreviewMessage(L"Preview graph could not be started.", true);
-        SetStatus(g_state.hdv
-                      ? L"HDV preview could not be started; decoder may be unavailable."
-                      : L"DV preview could not be started; capture remains available.");
+        SetStatus(L"DV preview could not be started; capture remains available.");
         return;
     }
-    SetStatus(g_state.hdv ? L"HDV preview is running."
-                          : L"DV preview is running.");
+    SetStatus(L"DV preview is running.");
 }
 
 void StopDvPreview() {
@@ -304,7 +259,6 @@ void StopDvPreview() {
         g_previewGraph = 0;
     }
     ShowWindow(g_state.previewWindow, SW_HIDE);
-    SetPreviewMessage(L"Preview disabled", true);
 }
 
 void StopGuiCapture() {
@@ -328,6 +282,7 @@ void StopGuiCapture() {
     g_state.captureInput = 0;
     g_state.captureOutput = 0;
     g_state.captureRunning = false;
+    EnableWindow(g_state.preview, TRUE);
     SetCaptureSummary(L"Capture finalized;");
 }
 
@@ -525,11 +480,6 @@ void StartGuiCapture() {
         SetStatus(L"Capture is already running.");
         return;
     }
-    const bool restartPreview = g_state.previewEnabled;
-    if (restartPreview) {
-        StopDvPreview();
-        SetStatus(L"Preview stopped while capture is starting.");
-    }
     GetWindowTextW(g_state.outputPath, g_state.capturePath,
                    ARRAYSIZE(g_state.capturePath));
     if (g_state.capturePath[0] == L'\0') {
@@ -591,6 +541,15 @@ void StartGuiCapture() {
         overwrite = true;
     }
 
+    const bool previewStopped = g_state.previewEnabled;
+    if (previewStopped) {
+        StopDvPreview();
+        CheckDlgButton(g_state.window, IdPreview, BST_UNCHECKED);
+        g_state.previewEnabled = false;
+        SetStatus(L"Preview is unavailable during capture; use the camcorder display.");
+    }
+    if (previewStopped) EnableWindow(g_state.preview, FALSE);
+
     wchar_t executablePath[MAX_PATH] = {};
     const DWORD pathLength = GetModuleFileNameW(
         0, executablePath, ARRAYSIZE(executablePath));
@@ -624,7 +583,8 @@ void StartGuiCapture() {
         if (childOutput != 0) CloseHandle(childOutput);
         if (parentOutput != 0) CloseHandle(parentOutput);
         SetStatus(L"Unable to create capture control pipe.");
-        if (restartPreview) StartDvPreview();
+        EnableWindow(g_state.preview, TRUE);
+        if (previewStopped) StartDvPreview();
         return;
     }
     SetHandleInformation(parentInput, HANDLE_FLAG_INHERIT, 0);
@@ -643,7 +603,8 @@ void StartGuiCapture() {
         CloseHandle(childOutput);
         CloseHandle(parentOutput);
         SetStatus(L"Unable to start capture process.");
-        if (restartPreview) StartDvPreview();
+        EnableWindow(g_state.preview, TRUE);
+        if (previewStopped) StartDvPreview();
         return;
     }
     CloseHandle(childInput);
@@ -1039,8 +1000,6 @@ void LayoutControls(int width, int height) {
     }
     MoveWindow(g_state.previewWindow, previewLeft, previewTop,
                previewWidth, previewHeight, TRUE);
-    MoveWindow(g_state.previewMessage, previewLeft, previewTop,
-               previewWidth, previewHeight, TRUE);
 
     const int controlsTop = height - 48;
     const int buttonWidth = (previewWidth - 20) / 5;
@@ -1127,12 +1086,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             L"STATIC", L"DV preview disabled",
             WS_CHILD | WS_VISIBLE | SS_CENTER | SS_BLACKRECT,
             0, 2000, 18, 148, 700, 250);
-        g_state.previewMessage = MakeControl(
-            L"STATIC", L"Preview disabled",
-            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOPREFIX,
-            0, 2001, 18, 148, 700, 250);
         ShowWindow(g_state.previewWindow, SW_HIDE);
-        ShowWindow(g_state.previewMessage, SW_HIDE);
 
         MakeControl(L"BUTTON", L"Rewind [R]", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                     0, IdRewind, 18, 410, 100, 30);
