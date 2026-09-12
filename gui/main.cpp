@@ -304,9 +304,23 @@ void UpdateCaptureStatus() {
     HANDLE output = CreateFileW(g_state.capturePath, GENERIC_READ,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-    const bool hasSize = output != INVALID_HANDLE_VALUE &&
-                         GetFileSizeEx(output, &size) != FALSE;
+    bool hasSize = output != INVALID_HANDLE_VALUE &&
+                   GetFileSizeEx(output, &size) != FALSE;
     if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+    if (!hasSize) {
+        wchar_t partialPath[MAX_PATH];
+        CopyText(partialPath, ARRAYSIZE(partialPath), g_state.capturePath);
+        int length = 0;
+        while (partialPath[length] != L'\0') ++length;
+        CopyText(partialPath + length, ARRAYSIZE(partialPath) - length,
+                 L".partial");
+        output = CreateFileW(partialPath, GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+        hasSize = output != INVALID_HANDLE_VALUE &&
+                  GetFileSizeEx(output, &size) != FALSE;
+        if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+    }
     if (hasSize) {
         wchar_t progress[160] = L"Capture running; video duration: ";
         int offset = 0;
@@ -498,6 +512,17 @@ void StartGuiCapture() {
         return;
     }
     EnsureCaptureExtension();
+    wchar_t absoluteCapturePath[MAX_PATH] = {};
+    const DWORD absoluteLength = GetFullPathNameW(
+        g_state.capturePath, ARRAYSIZE(absoluteCapturePath),
+        absoluteCapturePath, 0);
+    if (absoluteLength == 0 || absoluteLength >= ARRAYSIZE(absoluteCapturePath)) {
+        SetStatus(L"The output path is too long or invalid.");
+        return;
+    }
+    CopyText(g_state.capturePath, ARRAYSIZE(g_state.capturePath),
+             absoluteCapturePath);
+    SetText(g_state.outputPath, g_state.capturePath);
     long mode = ED_MODE_STOP;
     if (g_transport != 0 && SUCCEEDED(g_transport->get_Mode(&mode)) &&
         mode == ED_MODE_PLAY) {

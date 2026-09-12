@@ -1,14 +1,29 @@
 # firewire-capture
 
-`firewire-capture` is an experimental Windows command-line utility for archival capture of legacy DV and HDV video over IEEE-1394 (FireWire).
+`firewire-capture` is a Windows application for archival capture of legacy DV
+and HDV videotapes over IEEE-1394 (FireWire). It can be used as a graphical
+application or as a command-line program.
 
-The application preserves the native stream delivered by the camcorder. It does not decode, transcode, or re-encode video or audio during capture.
+The application preserves the native stream delivered by the camcorder. It
+does not decode, transcode, or re-encode the video or audio during capture.
+DV is saved as a native `.dv` stream and HDV is saved as a native MPEG-2
+transport stream in an `.m2t` file.
+
+Two builds are provided:
+
+- `fwcap.exe` for Windows 11;
+- `fwcap-xp.exe` for 32-bit Windows XP SP2 and later XP systems.
 
 ## Table of Contents
 
 - [License](#license)
 - [Project Status](#project-status)
 - [Usage](#usage)
+  - [Install or Place the Executable](#install-or-place-the-executable)
+  - [Graphical Application](#graphical-application)
+  - [Command-Line Use](#command-line-use)
+  - [Important Capture Caveats](#important-capture-caveats)
+  - [Recovering a Partial Capture](#recovering-a-partial-capture)
 - [Camera and FireWire Setup](#camera-and-firewire-setup)
 - [FireWire options for your PC](#firewire-options-for-your-pc)
   - [1. Native FireWire port on the PC](#1-native-firewire-port-on-the-pc)
@@ -28,6 +43,7 @@ The application preserves the native stream delivered by the camcorder. It does 
 - [Project Principles](#project-principles)
 - [Future Development](#future-development)
 - [Out of Scope](#out-of-scope)
+- [Development Rules](#development-rules)
 - [Repository Hygiene](#repository-hygiene)
 - [Contact and Contributing](#contact-and-contributing)
 - [Security Vulnerabilities](#security-vulnerabilities)
@@ -38,7 +54,15 @@ This project is provided under the MIT License. See the accompanying [LICENSE](L
 
 ## Project Status
 
-The current program uses native DirectShow sinks for both supported formats:
+The current program has a shared native Win32 GUI and a headless command-line
+mode. Both modes use the same native DirectShow capture engine and support DV
+and HDV transport control and capture.
+
+The Windows 11 and Windows XP programs are separate builds so the XP version
+can retain its XP SP2 and Pentium III compatibility requirements. They present
+the same user-facing workflow while using platform-appropriate build settings.
+
+The capture paths are:
 
 ```text
 DV camcorder
@@ -56,6 +80,20 @@ HDV camcorder
 
 Format selection is based on the actual DirectShow output pin and media type. The program does not use the camcorder manufacturer, model, or FriendlyName to decide whether a source is DV or HDV.
 
+Current behavior includes:
+
+- automatic FireWire camcorder discovery and DV/HDV format detection;
+- Rewind, Stop, Play, Capture, and Fast-forward transport controls;
+- optional DV video and audio preview during ordinary playback on supported
+  Windows configurations;
+- native DV and HDV capture without transcoding;
+- capture progress, timecode when the source provides valid timecode, video
+  duration, and byte-count reporting;
+- safe `.partial` output during capture and automatic final-file rename after
+  a clean stop;
+- an existing-output conflict check that requires approval before the GUI uses
+  overwrite mode, or an explicit `--overwrite` option on the command line.
+
 Native DV capture has been demonstrated:
 - with a Canon VIXIA HV30 playing a DV tape and set in Auto play STD
 - with a Panasonic PV-GS70D playing a DV tape
@@ -66,19 +104,83 @@ Native HDV capture has been demonstrated:
 Capture ending has been demonstrated:
 - by the video ending on the tape
 - by stopping the camcorder transport
-- by pressing Enter on the PC to end the command line program
+- by pressing Enter in command-line mode;
+- by pressing Stop in the GUI.
 
-
-The current Win32/x86 build is the validated configuration. 
-Older Windows versions require separate toolchain, driver, and hardware testing.
-The native sinks do not inherently require x86, but x64 and older Windows versions have not yet been validated.
+Both current executables are Win32/x86 applications. The XP build targets
+Windows XP SP2 and baseline IA-32 instructions for Pentium III-class hardware.
+An x64 build is not currently provided.
 
 ## Usage
 
-The command-line form is:
+### Install or Place the Executable
+
+There is currently no installer. Copy the executable appropriate for the PC to
+a permanent tools directory:
+
+- use `fwcap.exe` on Windows 11;
+- use `fwcap-xp.exe` on Windows XP.
+
+You can add that tools directory to the Windows `PATH`. If it is on `PATH`, the
+program can be started by name from any Command Prompt. If it is not on `PATH`,
+open the tools directory and double-click the executable for the GUI, or run it
+from a Command Prompt whose current directory is that tools directory.
+
+The application is portable in the sense that it does not need to be installed
+or registered. Keep any captures in a separate folder with enough free disk
+space; native DV and HDV capture files are large.
+
+### Graphical Application
+
+Start the appropriate executable with no parameters to open the GUI:
 
 ```cmd
-fwcap.exe [-v] <capture-name>
+fwcap.exe
+```
+
+or, on Windows XP:
+
+```cmd
+fwcap-xp.exe
+```
+
+Double-clicking the executable also starts it with no parameters and opens the
+GUI.
+
+The GUI detects the connected FireWire camcorder and reports whether Windows is
+currently exposing a DV or HDV source. To capture:
+
+1. Power on the connected camcorder in VCR/playback mode.
+2. Confirm that the correct device and DV or HDV format are shown.
+3. Use **Browse** to choose the output filename and directory.
+4. Cue the tape with Rewind, Play, Stop, and Fast-forward as needed.
+5. Select **Capture**. If the tape is stopped, capture starts the transport. If
+   it is already playing, the program asks whether to capture from the current
+   position.
+6. Select **Stop** to finish. A clean stop closes the capture and changes the
+   working `.partial` file to the final `.dv` or `.m2t` filename.
+
+The GUI buttons also have case-insensitive keyboard shortcuts:
+
+| Key | Action |
+| --- | --- |
+| `R` | Rewind |
+| `S` | Stop transport or stop the active capture |
+| `P` | Play |
+| `C` | Capture |
+| `F` | Fast-forward |
+
+The application never puts the camcorder into camera recording mode. The
+**Capture** command means "save the stream coming from the tape to the PC."
+
+### Command-Line Use
+
+Supplying parameters starts the same executable in headless command-line mode
+instead of opening the GUI:
+
+```cmd
+fwcap.exe [-v] [--overwrite] [--hdv-discard] <capture-name>
+fwcap-xp.exe [-v] [--overwrite] [--hdv-discard] <capture-name>
 ```
 
 Examples:
@@ -88,48 +190,134 @@ fwcap.exe capture
 fwcap.exe capture.dv
 fwcap.exe capture.m2t
 fwcap.exe -v capture
-fwcap.exe -v capture.dv
-fwcap.exe -v capture.m2t
+fwcap.exe --overwrite capture.dv
+fwcap-xp.exe capture
 ```
 
-The program discovers the source format from DirectShow. If the requested name does not have the correct extension, the appropriate extension is appended rather than replacing the supplied name. For example, an HDV request named `capture.dv` becomes `capture.dv.m2t`, or a DV request named capture.m2t becomes capture.m2t.dv.
+The program discovers the source format from DirectShow; the user does not
+select DV or HDV on the command line. It normalizes the output extension to
+`.dv` for DV or `.m2t` for HDV. A conflicting `.dv` or `.m2t` extension is
+replaced. If the name has neither extension, the detected extension is
+appended.
 
-The `-v` option enables successful HRESULT and diagnostic messages. Errors and the final summary are always printed. During capture, the program displays one updating progress line containing:
+Options:
+
+| Option | Purpose |
+| --- | --- |
+| `-v` | Print successful DirectShow operations and additional diagnostics. |
+| `--overwrite` | Permit replacement of an existing final capture and deletion of an existing partial capture. |
+| `--hdv-discard` | Diagnostic HDV mode that receives the stream without writing a file. Do not use this option for an ordinary capture or with a DV source. |
+
+Errors and the final summary are printed without `-v`. During capture, the
+program displays an updating progress line containing:
 
 - detected format;
 - current timecode when valid, or `?:??:??:??` when timecode is unavailable or invalid;
 - duration;
 - bytes received or written.
 
-The final summary reports the normalized output path, Final Valid Timecode, Total Capture Process Duration, Video Duration, Byte Count, and Accepted Sample Count where available.
+The final summary reports the normalized output path, final valid timecode,
+total capture-process duration, video duration, byte count, and accepted sample
+count where available.
 
-Total Capture Process Duration includes startup, transport, inactivity timeout, and shutdown timing. 
-Video Duration is based on media/timecode information where available.
-The two values may differ substantially.
+Total Capture Process Duration measures the active capture interval used by the
+capture engine. It may include transport and inactivity waiting, but it is not
+the elapsed time for the entire program: initial device/graph setup and final
+shutdown are outside some or all of that measurement. Video Duration is based
+on media/timecode information where available, so the two values may differ
+substantially.
 
-The program can start a stopped tape and stops the transport when capture ends. If the camcorder is already playing, the program leaves it playing and does not issue a second PLAY command. Pressing Enter stops the graph and issues transport STOP.
+The program can start a stopped tape and stops the transport when capture ends.
+If the camcorder is already playing, the program does not issue a second Play
+command. Press Enter to stop a command-line capture cleanly.
 
 Capture also stops when DirectShow reports an end condition, the transport reports STOP, or no media activity has been observed for ten seconds. Automatic file segmentation across long gaps is not currently implemented.
 
+### Important Capture Caveats
+
+- Connect or disconnect the FireWire cable only while the camcorder is powered
+  off. Avoid hot-plugging the small FireWire connector at the camcorder.
+- When changing between DV and HDV playback/capture, power off the camcorder,
+  unplug and reconnect the FireWire connection, and then power the camcorder
+  back on in VCR/playback mode. Windows may otherwise continue exposing the
+  previous format even after the tape or camcorder setting changes.
+- There is no supported application preview while Capture is running, for
+  either DV or HDV. Watch the camcorder's own LCD or viewfinder during capture.
+  If the preview checkbox remains available in a current build, do not enable
+  it during capture.
+- DV preview is only for cueing and ordinary playback when Capture is not
+  running. It depends on the DirectShow components installed on the PC.
+- HDV preview is not currently supported in the application. Use the camcorder
+  display for HDV playback and capture monitoring. This does not affect native
+  HDV capture.
+- Timecode can be missing or invalid on a tape. The program reports unknown
+  timecode rather than inventing a value. Recording date is not currently
+  available.
+- Make sure the destination has enough free disk space before beginning a long
+  capture.
+
+### Recovering a Partial Capture
+
+While capture is active, the program writes to a filename ending in
+`.partial`, for example:
+
+```text
+family-tape.dv.partial
+family-tape.m2t.partial
+```
+
+After a normal Stop, the program closes the stream and automatically removes
+the final `.partial` suffix, producing `family-tape.dv` or `family-tape.m2t`.
+
+If the program, Windows, or the PC crashes, the `.partial` file is intentionally
+left in place. It contains the native data received and written before the
+interruption. After the capture program is no longer running, rename the file
+by removing only the final `.partial` extension:
+
+```text
+family-tape.dv.partial   -> family-tape.dv
+family-tape.m2t.partial  -> family-tape.m2t
+```
+
+If a file with the desired final name already exists, do not overwrite it just
+to remove `.partial`. Either move the old final file to a safe name first or
+give the recovered capture a different valid `.dv` or `.m2t` name. This can
+happen when a replacement capture was started in overwrite mode but crashed
+before the new partial file replaced the old final file.
+
+The recovered file may contain everything captured up to shortly before the
+failure and can often be opened by a player or media tool that supports raw DV
+or MPEG-2 transport streams. Because the capture did not end cleanly, the last
+portion may be incomplete. Preserve the partial file until the recovered media
+has been checked.
+
 ## Camera and FireWire Setup
 
-It is safest to only connect or disconnect the FireWire cable while the camcorder is powered off. Avoid hot-plugging the cable at the camcorder end.
+Only connect or disconnect the FireWire cable while the camcorder is powered
+off. FireWire ports, especially the small unpowered 4-pin camcorder connector,
+can be damaged by incorrect or repeated hot-plugging.
 
 Some camcorders support both DV and HDV tapes. When changing tape formats:
 
-1. Insert or switch the tape format.
-2. Set the camcorder’s output/playback format to Auto or the required format.
+1. Stop capture and close any application that is using the camcorder.
+2. Insert the tape and set the camcorder's playback/output format to Auto, DV,
+   or HDV as appropriate.
 3. Power the camcorder off.
-4. Connect or reconnect FireWire while powered off.
+4. Unplug and reconnect the FireWire cable while the camcorder is off.
 5. Power the camcorder on in VCR/playback mode.
-6. Play the tape briefly so Windows Device Manager and DirectShow expose the active format.
+6. Start `fwcap` and confirm that it reports the expected DV or HDV format.
+7. If necessary, play the tape briefly so Windows and DirectShow expose the
+   active format.
 
 Power cycling after a format change gives Windows and DirectShow an opportunity to expose the correct source and media format. The application cannot safely infer the new format from tape content if Windows is still exposing the previous format.
 
 On the tested Windows 11 setup:
-- Windows Device Manager showed an IEEE-1394 category if a IEEE-1394 (firewire) controller is found.
-- If a DV format camcorder in VCR mode was found, Device Manager showed it in the "Imaging Devices" category.
-- If an HDV format camcorder in VCR mode was found, Device Manager showed it in the "Sound, video and game controllers" category.
+
+- Device Manager showed an IEEE-1394 category when an IEEE-1394/FireWire
+  controller was present.
+- A DV camcorder in VCR mode appeared under **Imaging devices**.
+- An HDV camcorder in VCR mode appeared under **Sound, video and game
+  controllers**.
 
 ## FireWire options for your PC
 
@@ -292,10 +480,14 @@ the camcorder manufacturer or model.
 
 ## Antivirus Webcam Protection
 
-An antivirus product may classify a FireWire DV or HDV camcorder as WebCam access because Windows exposes the camcorder through DirectShow. 
+An antivirus product may classify access to a FireWire DV or HDV camcorder as
+webcam access because Windows exposes the camcorder through DirectShow.
 
-For example, on first use, Bitdefender Webcam Protection prompted for `fwcap.exe` even though the laptop's built-in webcam is not being used.
-Select **Allow** for `fwcap.exe`. If access was previously blocked, Bitdefender was checked:
+For example, on first use, Bitdefender Webcam Protection prompted for
+`fwcap.exe` even though the laptop's built-in webcam was not being used. Select
+**Allow** for the appropriate `fwcap.exe` or `fwcap-xp.exe`. If access was
+previously blocked, check the antivirus application's per-program webcam
+permissions. In the tested Bitdefender version, the path was:
 
 ```text
 Bitdefender
@@ -305,11 +497,22 @@ Bitdefender
            -> Webcam Protection
 ```
 
-The `fwcap.exe` entry should have the allowed blue camera icon. Do not disable Webcam Protection globally or add a general antivirus exclusion. If access remains blocked, the program may report `E_ACCESSDENIED` during transport control or receive no samples.
+The executable's entry should be allowed. Do not disable Webcam Protection
+globally or add a broad antivirus exclusion. If access remains blocked, the
+program may report `E_ACCESSDENIED` during device or transport access, or it may
+receive no samples.
 
 ## How It Works
 
-The program:
+With no parameters, the executable initializes the shared Win32 GUI, discovers
+the FireWire source, and exposes device status, transport controls, output-file
+selection, and optional DV playback preview. Selecting Capture starts a hidden
+headless instance of the same executable and communicates with it through
+pipes. The capture process owns the native DirectShow capture graph. This keeps
+the GUI responsive while retaining one capture implementation for graphical
+and command-line use.
+
+With command-line parameters, the executable runs the capture engine directly:
 
 1. initializes COM;
 2. enumerates DirectShow video-input monikers;
@@ -317,18 +520,29 @@ The program:
 4. filters non-FireWire candidates before source activation;
 5. binds a supported source filter;
 6. classifies DV or HDV from the actual output pin/media type;
-7. creates the corresponding native sink;
-8. connects the source directly to the sink;
-9. queries transport state and issues PLAY only when needed;
-10. receives and writes native sample payloads without transcoding;
-11. monitors transport, graph events, and media activity;
-12. stops and finalizes the capture automatically or when Enter is pressed.
+7. normalizes the output filename and creates its `.partial` working file;
+8. creates the corresponding native sink;
+9. connects the source directly to the sink;
+10. queries transport state and issues Play only when needed;
+11. receives and writes native sample payloads without transcoding;
+12. periodically flushes written data and reports progress;
+13. monitors transport, graph events, and media activity;
+14. stops automatically or in response to the GUI/keyboard;
+15. closes the graph and renames the working file to its final `.dv` or `.m2t`
+    name after a clean capture.
+
+The playback-preview graph is separate from the capture graph. DV preview is
+stopped before capture because the camcorder and its DirectShow output cannot
+be shared reliably between those graphs. HDV preview is not implemented because
+a suitable built-in MPEG-2 DirectShow decoding path was not available on the
+tested system.
 
 DV timecode is read from native DV data when valid. HDV timecode is read through the source's standard timecode interface when available. Unknown or invalid timecode is displayed as `?:??:??:??`; the program does not manufacture timecode from wall-clock time.
 
 ## Development Environment
 
-Primary development environment: Windows 11.
+Primary development environment: Windows 11. The XP-compatible product is
+cross-built on Windows 11 and tested separately on Windows XP SP2 hardware.
 
 Installed development components:
 
@@ -339,11 +553,13 @@ Installed development components:
 
 VS Code/Kilo may be used as the normal development environment. The Visual Studio IDE is not required for command-line builds.
 
-The project has been successfully built with the Visual Studio 2026 `v145` platform toolset and Windows SDK `10.0.28000.2114`.
+The projects have been successfully built with the Visual Studio 2026 `v145`
+platform toolset and Windows SDK `10.0.28000.2114`.
 
 ## Build
 
-Build the x86 Release configuration from a developer environment in which MSBuild is available:
+Build the Windows 11 Win32 Release configuration from a developer environment
+in which MSBuild is available:
 
 ```cmd
 msbuild firewire-capture.sln /m /p:Configuration=Release /p:Platform=x86
@@ -355,10 +571,29 @@ Expected executable:
 bin\Release\fwcap.exe
 ```
 
+The XP project is deliberately separate from the modern solution. Build it
+from the `fwcap-xp` directory:
+
+```cmd
+msbuild fwcap-xp.vcxproj /m /p:Configuration=Release /p:Platform=Win32
+```
+
+Expected executable:
+
+```text
+fwcap-xp\bin\Release\fwcap-xp.exe
+```
+
+Both projects compile the shared `gui\main.cpp` and icon resources directly
+into their respective executable. There is no separate GUI executable to
+distribute.
+
 ### Antivirus issues
 
-This program is currently unknown to (unregistered for) antimalware programs.
-It may quarantine a build product at build time, or the application at runtime, if its heuristics classify the executable as suspicious.
+These executables are currently unsigned and may be unknown to antimalware
+reputation systems. An antivirus application may quarantine a build product at
+build time or block it at runtime if its heuristics classify the executable as
+suspicious.
 
 During new software development, antivirus software may flag a newly built, unsigned executable. You can use the antivirus' normal per-application and/or per-folder permission mechanisms rather than disabling protection globally.
 
@@ -391,6 +626,10 @@ Real captures demonstrated:
 - 48 kHz stereo PCM audio;
 - successful VLC playback.
 
+On Windows 11, the GUI's optional DV playback preview has also been demonstrated
+with the correct 4:3 display aspect ratio and playback audio. Preview is not
+used while capture is active.
+
 FFmpeg has reported invalid embedded DV timecode on some source captures. The program preserves the received DV bytes and does not rewrite that metadata.
 
 The Canon VIXIA HV30 also successfully played a Panasonic-recorded DV tape through the native DV path.
@@ -418,6 +657,9 @@ The native HDV sink has been verified with:
 - automatic stop after ten seconds without media activity;
 - approximately 42-minute native capture producing 8,455,295,488 bytes.
 
+Native HDV capture works without an in-application preview. The camcorder LCD
+or viewfinder is used for monitoring.
+
 FFmpeg reports auxiliary MPEG-TS streams `0xA0` and `0xA1` as unknown. These are expected from the source and do not prevent the primary video and audio streams from decoding.
 
 ## Project Principles
@@ -436,16 +678,17 @@ Possible future work includes:
 - More testing of end-of-tape encountered (video all the way to end);
 - MPEG-TS continuity-counter diagnostics;
 - improved HDV timecode reporting;
-- removal of the --hdv-discard testing param and its effect of more HDV diagnostics and not writing data to file
+- removal or replacement of the `--hdv-discard` diagnostic option;
 - better DV timecode validation and reporting;
 - configurable no-media timeout;
 - optional gap detection and segmented output;
 - device-removal recovery;
 - long-duration and whole-tape regression tests;
 - x64 build evaluation;
-- evaluation of older Windows compatibility;
+- broader Windows 11 and Windows XP hardware testing;
 - more detailed capture-session metadata;
-- optional GUI support.
+- possible HDV playback-preview support through a suitable decoder;
+- evaluation of a single-graph preview-and-capture architecture.
 
 ## Out of Scope
 
@@ -454,7 +697,7 @@ Possible future work includes:
 - a nonlinear editor;
 - a transcoder;
 - a restoration suite;
-- a media player;
+- a general-purpose media player;
 - a general-purpose FFmpeg replacement.
 
 Captured material can be processed by dedicated tools after preservation ingest.

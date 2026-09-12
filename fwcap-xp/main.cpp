@@ -369,6 +369,7 @@ private:
     volatile LONGLONG bytes_;
     volatile LONG samples_;
     volatile LONG lastSampleTick_;
+    volatile LONG lastFlushTick_;
     volatile LONG hasTimecode_;
     volatile LONG latestTimecode_;
     volatile LONG hasMediaTime_;
@@ -561,7 +562,7 @@ CaptureSink::CaptureSink()
       outputFile_(INVALID_HANDLE_VALUE), bytes_(0), samples_(0),
       lastSampleTick_(0), hasTimecode_(0), latestTimecode_(0),
       hasMediaTime_(0), firstSampleTime_(0), lastSampleEndTime_(0),
-      hdvStream_(0) {}
+      hdvStream_(0), lastFlushTick_(0) {}
 
 CaptureSink::~CaptureSink() {
     if (pin_ != 0) {
@@ -585,6 +586,15 @@ HRESULT CaptureSink::Write(IMediaSample* sample) {
         if (!WriteFile(outputFile_, data, static_cast<DWORD>(length), &written, 0) ||
             written != static_cast<DWORD>(length)) {
             return HRESULT_FROM_WIN32(GetLastError());
+        }
+        const ULONG now = GetTickCount();
+        const ULONG lastFlush = static_cast<ULONG>(
+            InterlockedCompareExchange(&lastFlushTick_, 0, 0));
+        if (static_cast<LONG>(now - lastFlush) >= 1000) {
+            if (!FlushFileBuffers(outputFile_)) {
+                return HRESULT_FROM_WIN32(GetLastError());
+            }
+            InterlockedExchange(&lastFlushTick_, static_cast<LONG>(now));
         }
     }
     if (hdvStream_ == 0) {

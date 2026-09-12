@@ -289,6 +289,7 @@ private:
     HANDLE outputFile_ = INVALID_HANDLE_VALUE;
     volatile LONGLONG bytesWritten_ = 0;
     volatile LONGLONG lastSampleTick_ = 0;
+    volatile LONGLONG lastFlushTick_ = 0;
     bool hdvDiscard_ = false;
     bool writeOutput_ = true;
     mutable std::mutex timecodeMutex_;
@@ -513,6 +514,15 @@ HRESULT DvDiscardFilter::WriteSample(IMediaSample* sample) {
         }
         offset += written;
         InterlockedExchangeAdd64(&bytesWritten_, written);
+    }
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG lastFlush = static_cast<ULONGLONG>(
+        InterlockedCompareExchange64(&lastFlushTick_, 0, 0));
+    if (now - lastFlush >= 1000) {
+        if (!FlushFileBuffers(outputFile_)) {
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+        InterlockedExchange64(&lastFlushTick_, static_cast<LONGLONG>(now));
     }
     DvTimecode timecode;
     if (FindDvTimecode(data, length, &timecode)) {
