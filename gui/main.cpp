@@ -58,6 +58,7 @@ struct GuiState {
     HWND previewWindow;
     HFONT headingFont;
     HFONT normalFont;
+    HFONT compactFont;
     HFONT buttonFont;
     HBRUSH backgroundBrush;
     HBRUSH panelBrush;
@@ -479,6 +480,12 @@ void StartGuiCapture() {
     GetWindowTextW(g_state.outputPath, g_state.capturePath,
                    ARRAYSIZE(g_state.capturePath));
     if (g_state.capturePath[0] == L'\0') {
+        long mode = ED_MODE_STOP;
+        if (g_transport != 0 && SUCCEEDED(g_transport->get_Mode(&mode)) &&
+            mode == ED_MODE_PLAY) {
+            SetStatus(L"The tape is playing. Choose an output filename before starting capture.");
+            return;
+        }
         BrowseForOutput();
         GetWindowTextW(g_state.outputPath, g_state.capturePath,
                        ARRAYSIZE(g_state.capturePath));
@@ -488,6 +495,19 @@ void StartGuiCapture() {
         return;
     }
     EnsureCaptureExtension();
+    long mode = ED_MODE_STOP;
+    if (g_transport != 0 && SUCCEEDED(g_transport->get_Mode(&mode)) &&
+        mode == ED_MODE_PLAY) {
+        const int answer = MessageBoxW(
+            g_state.window,
+            L"The tape is currently playing. Capture from the current tape position?",
+            L"Capture while playing",
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+        if (answer != IDYES) {
+            SetStatus(L"Capture cancelled; tape position was not changed.");
+            return;
+        }
+    }
     bool overwrite = false;
     wchar_t partialPath[MAX_PATH];
     CopyText(partialPath, ARRAYSIZE(partialPath), g_state.capturePath);
@@ -934,12 +954,27 @@ void LayoutControls(int width, int height) {
     const int bottomHeight = 112;
     const int previewMaxHeight = height - bottomHeight - previewTop - margin;
 
-    MoveWindow(g_state.device, margin, 24, infoWidth, 28, TRUE);
-    MoveWindow(g_state.format, margin, 64, infoWidth, 28, TRUE);
-    MoveWindow(g_state.transport, margin, 104, infoWidth, 28, TRUE);
-    MoveWindow(g_state.timecode, margin, 144, infoWidth, 28, TRUE);
-    MoveWindow(g_state.recordingDate, margin, 184, infoWidth, 28, TRUE);
-    MoveWindow(g_state.preview, margin, 230, infoWidth, 24, TRUE);
+    const bool compact = width < 900 || height < 650;
+    HFONT leftFont = compact ? g_state.compactFont : g_state.normalFont;
+    HWND leftControls[] = {g_state.device, g_state.format, g_state.transport,
+                           g_state.timecode, g_state.recordingDate,
+                           g_state.preview, g_state.progress, g_state.status};
+    for (int index = 0; index < ARRAYSIZE(leftControls); ++index) {
+        SendMessageW(leftControls[index], WM_SETFONT,
+                     reinterpret_cast<WPARAM>(leftFont), TRUE);
+    }
+    const int rowStep = compact ? 28 : 40;
+    const int firstRow = compact ? 18 : 24;
+    MoveWindow(g_state.device, margin, firstRow, infoWidth, 28, TRUE);
+    MoveWindow(g_state.format, margin, firstRow + rowStep, infoWidth, 28, TRUE);
+    MoveWindow(g_state.transport, margin, firstRow + rowStep * 2,
+               infoWidth, 28, TRUE);
+    MoveWindow(g_state.timecode, margin, firstRow + rowStep * 3,
+               infoWidth, 28, TRUE);
+    MoveWindow(g_state.recordingDate, margin, firstRow + rowStep * 4,
+               infoWidth, 28, TRUE);
+    const int previewToggleTop = compact ? 158 : 224;
+    MoveWindow(g_state.preview, margin, previewToggleTop, infoWidth, 28, TRUE);
     const int aspectX = g_state.hdv ? 16 : 4;
     const int aspectY = g_state.hdv ? 9 : 3;
     int previewWidth = width - previewLeft - margin;
@@ -952,7 +987,7 @@ void LayoutControls(int width, int height) {
     MoveWindow(g_state.previewWindow, previewLeft, previewTop,
                previewWidth, previewHeight, TRUE);
 
-    const int controlsTop = height - 92;
+    const int controlsTop = height - 48;
     const int buttonWidth = (previewWidth - 20) / 5;
     HWND buttons[] = {
         GetDlgItem(g_state.window, IdRewind), GetDlgItem(g_state.window, IdStop),
@@ -975,15 +1010,18 @@ void LayoutControls(int width, int height) {
         MoveWindow(buttons[index], previewLeft + index * (buttonWidth + 5),
                    controlsTop, buttonWidth, 30, TRUE);
     }
-    const int outputTop = height - 48;
+    const int outputTop = height - 92;
     const int outputX = margin + 82;
     MoveWindow(GetDlgItem(g_state.window, 2100), margin, outputTop, 76, 25, TRUE);
     MoveWindow(g_state.outputPath, outputX, outputTop,
                width - outputX - margin - 92, 25, TRUE);
     MoveWindow(GetDlgItem(g_state.window, IdBrowse), width - margin - 82,
                outputTop, 82, 25, TRUE);
-    MoveWindow(g_state.progress, margin, 274, infoWidth, 44, TRUE);
-    MoveWindow(g_state.status, margin, 324, infoWidth, 48, TRUE);
+    int statusTop = compact ? 240 : outputTop - 62;
+    if (statusTop > 324) statusTop = 324;
+    const int progressTop = compact ? 198 : statusTop - 50;
+    MoveWindow(g_state.progress, margin, progressTop, infoWidth, 42, TRUE);
+    MoveWindow(g_state.status, margin, statusTop, infoWidth, 48, TRUE);
     InvalidateRect(g_state.status, 0, TRUE);
 }
 
@@ -997,6 +1035,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Tahoma");
         g_state.normalFont = CreateFontW(
             -15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Tahoma");
+        g_state.compactFont = CreateFontW(
+            -13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Tahoma");
         g_state.buttonFont = CreateFontW(
@@ -1024,7 +1066,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                                             WS_CHILD | WS_VISIBLE, 0, IdRecordingDate,
                                             350, 82, 250, 24);
         g_state.preview = MakeControl(L"BUTTON", L"Enable video preview",
-                                      WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                      WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_VCENTER,
                                       0, IdPreview, 18, 116, 180, 24);
         g_state.previewWindow = MakeControl(
             L"STATIC", L"DV preview disabled",
@@ -1135,6 +1177,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         ReleaseCameraInterfaces();
         if (g_state.headingFont != 0) DeleteObject(g_state.headingFont);
         if (g_state.normalFont != 0) DeleteObject(g_state.normalFont);
+        if (g_state.compactFont != 0) DeleteObject(g_state.compactFont);
         if (g_state.buttonFont != 0) DeleteObject(g_state.buttonFont);
         if (g_state.backgroundBrush != 0) DeleteObject(g_state.backgroundBrush);
         if (g_state.panelBrush != 0) DeleteObject(g_state.panelBrush);
